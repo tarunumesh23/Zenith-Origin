@@ -21,6 +21,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
+# Suppress noisy discord.py internals
+logging.getLogger("discord.client").setLevel(logging.WARNING)
+logging.getLogger("discord.player").setLevel(logging.ERROR)
+
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
@@ -33,10 +37,10 @@ def _require_env(key: str) -> str:
         sys.exit(1)
     return value
 
-TOKEN           = _require_env("token")
+TOKEN            = _require_env("token")
 REQUIRED_ROLE_ID = int(_require_env("REQUIRED_ROLE_ID"))
-REQUIRE_ROLE    = os.getenv("REQUIRE_ROLE", "true").lower() == "true"
-OWNER_ID        = int(os.getenv("OWNER_ID", "0"))
+REQUIRE_ROLE     = os.getenv("REQUIRE_ROLE", "true").lower() == "true"
+OWNER_ID         = int(os.getenv("OWNER_ID", "0"))
 
 EXCLUDED_FOLDERS = {"ui", "__pycache__"}
 
@@ -51,6 +55,8 @@ bot = commands.Bot(
     intents=intents,
     help_command=None,
 )
+
+_ready = False  # guard against on_ready firing on reconnects
 
 # ---------------------------------------------------------------------------
 # Global check
@@ -84,7 +90,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         await msg.delete()
         return
 
-    # Re-raise anything unexpected so it surfaces in logs
     raise error
 
 # ---------------------------------------------------------------------------
@@ -92,6 +97,12 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready() -> None:
+    global _ready
+    if _ready:
+        log.warning("on_ready fired again (reconnect) — skipping re-initialisation")
+        return
+    _ready = True
+
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
@@ -116,7 +127,6 @@ async def on_ready() -> None:
     success, failed, skipped = [], [], []
 
     for root, dirs, files in os.walk("./cogs"):
-        # Report and prune excluded folders in-place
         for d in list(dirs):
             if d in EXCLUDED_FOLDERS:
                 folder = os.path.join(root, d).replace("./", "").replace(os.sep, "/")
@@ -160,7 +170,7 @@ async def _shutdown() -> None:
 
 def _handle_signal(signum, _frame) -> None:
     log.info("Received signal %s", signal.Signals(signum).name)
-    asyncio.get_event_loop().create_task(_shutdown())
+    asyncio.get_running_loop().create_task(_shutdown())
 
 # ---------------------------------------------------------------------------
 # Entry point

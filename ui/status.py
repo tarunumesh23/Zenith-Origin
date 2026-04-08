@@ -11,10 +11,14 @@ log = logging.getLogger("bot.status")
 IST = pytz.timezone("Asia/Kolkata")
 
 _STATUS_CONFIG: dict[str, tuple[discord.Color, str, str]] = {
-    "start": (discord.Color.green(),   "🟢 Bot Online",   "Bot has started successfully."),
-    "stop":  (discord.Color.red(),     "🔴 Bot Offline",  "Bot has been stopped."),
-    "crash": (discord.Color.orange(),  "🟠 Bot Crashed",  "Bot has crashed and is restarting."),
+    "start": (discord.Color.green(),  "🟢 Bot Online",  "Bot has started successfully."),
+    "stop":  (discord.Color.red(),    "🔴 Bot Offline", "Bot has been stopped."),
+    "crash": (discord.Color.orange(), "🟠 Bot Crashed", "Bot has crashed and is restarting."),
 }
+
+# Prime the CPU counter at import time so the first real call returns a
+# meaningful percentage instead of 0.0 (psutil needs two samples to diff).
+psutil.cpu_percent(interval=None)
 
 
 def _system_fields() -> list[tuple[str, str, bool]]:

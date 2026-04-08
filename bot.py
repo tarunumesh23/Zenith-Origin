@@ -56,7 +56,8 @@ bot = commands.Bot(
     help_command=None,
 )
 
-_ready = False  # guard against on_ready firing on reconnects
+_ready   = False  # guard against on_ready firing on reconnects
+_started = False  # True only after on_ready fully completes
 
 # ---------------------------------------------------------------------------
 # Global check
@@ -97,7 +98,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready() -> None:
-    global _ready
+    global _ready, _started
     if _ready:
         log.warning("on_ready fired again (reconnect) — skipping re-initialisation")
         return
@@ -118,7 +119,6 @@ async def on_ready() -> None:
     try:
         await database.connect()
         await run_migrations()
-        await send_status(bot, "start")
         log.info("Database    » Connected")
     except Exception:
         log.exception("Database    » Failed to connect")
@@ -156,13 +156,19 @@ async def on_ready() -> None:
     log.info("Slash cmds  » Synced")
     log.info("=" * 40)
 
+    # Mark startup as complete BEFORE sending status so _shutdown()
+    # can only send "stop" if this line has been reached.
+    _started = True
+    await send_status(bot, "start")
+
 # ---------------------------------------------------------------------------
 # Shutdown helpers
 # ---------------------------------------------------------------------------
 async def _shutdown() -> None:
     log.info("Shutting down...")
     try:
-        await send_status(bot, "stop")
+        if _started:
+            await send_status(bot, "stop")
         await database.disconnect()
     except Exception:
         log.exception("Error during shutdown cleanup")

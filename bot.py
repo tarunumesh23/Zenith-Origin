@@ -169,11 +169,7 @@ async def on_ready() -> None:
 async def _shutdown() -> None:
     log.info("Shutting down...")
     try:
-        uptime = time.monotonic() - _start_time if _start_time else 0
-        if _started and uptime > 30:
-            await send_status(bot, "stop")
-        else:
-            log.info("Skipping stop status — uptime %.1fs is too short (redeploy)", uptime)
+        # DO NOT send "stop" on SIGTERM (this is usually a restart)
         await database.disconnect()
     except Exception:
         log.exception("Error during shutdown cleanup")
@@ -190,8 +186,13 @@ async def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    async with bot:
-        await bot.start(TOKEN)
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+    except Exception:
+        log.exception("Bot crashed")
+        await send_status(bot, "crash")
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main())

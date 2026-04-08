@@ -1,8 +1,7 @@
-from db.database import execute
-
+import asyncio
+from db.database import connect, disconnect, execute
 
 # Add all your table creation queries here
-# Each migration runs only if the table doesn't exist yet
 MIGRATIONS = [
     """
     CREATE TABLE IF NOT EXISTS users (
@@ -12,7 +11,7 @@ MIGRATIONS = [
     )
     """,
 
-    # Add new tables here in the future
+    # Future tables can be added here
     # """
     # CREATE TABLE IF NOT EXISTS economy (
     #     user_id BIGINT PRIMARY KEY,
@@ -23,6 +22,19 @@ MIGRATIONS = [
 
 
 async def run_migrations():
+    # Connect to the database
+    await connect()
+
+    # Run each migration
     for query in MIGRATIONS:
         await execute(query)
+
     print("  🗄️  Migrations   » Done")
+
+    # Disconnect from the database
+    await disconnect()
+
+
+# Run migrations when the script is executed directly
+if __name__ == "__main__":
+    asyncio.run(run_migrations())

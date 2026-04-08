@@ -1,5 +1,6 @@
-import aiomysql
 import os
+import aiomysql
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,16 +10,24 @@ pool = None
 
 async def connect():
     global pool
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL not set")
+
+    url = urlparse(database_url)
+
     pool = await aiomysql.create_pool(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=int(os.getenv("DB_PORT", 3306)),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        db=os.getenv("DB_NAME"),
+        host=url.hostname,
+        port=url.port,
+        user=url.username,
+        password=url.password,
+        db=url.path[1:],  # removes leading '/'
         autocommit=True,
         minsize=1,
         maxsize=10,
     )
+
     print("  🗄️  Database     » Connected")
 
 

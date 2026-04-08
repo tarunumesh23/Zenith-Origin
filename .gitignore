@@ -12,6 +12,8 @@ __pycache__/
 dist/
 build/
 
+.db/
+
 # Virtual environment
 .venv/
 

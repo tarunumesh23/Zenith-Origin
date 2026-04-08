@@ -1,64 +1,73 @@
-import discord
+import logging
 import os
-import psutil
 from datetime import datetime
+
+import discord
+import psutil
 import pytz
+
+log = logging.getLogger("bot.status")
 
 IST = pytz.timezone("Asia/Kolkata")
 
+_STATUS_CONFIG: dict[str, tuple[discord.Color, str, str]] = {
+    "start": (discord.Color.green(),   "🟢 Bot Online",   "Bot has started successfully."),
+    "stop":  (discord.Color.red(),     "🔴 Bot Offline",  "Bot has been stopped."),
+    "crash": (discord.Color.orange(),  "🟠 Bot Crashed",  "Bot has crashed and is restarting."),
+}
 
-def get_system_info():
-    return {
-        "cpu": f"{psutil.cpu_percent()}%",
-        "ram": f"{psutil.virtual_memory().percent}%",
-    }
+
+def _system_fields() -> list[tuple[str, str, bool]]:
+    """Return (name, value, inline) tuples for CPU and RAM embed fields."""
+    mem = psutil.virtual_memory()
+    return [
+        ("⚙️ CPU", f"{psutil.cpu_percent(interval=None)}%", True),
+        ("🧠 RAM", f"{mem.percent}%  ({mem.used // 1024**2} / {mem.total // 1024**2} MB)", True),
+    ]
 
 
-async def send_status(bot, status: str):
-    channel_id = int(os.getenv("STATUS_CHANNEL_ID"))
+async def send_status(bot: discord.Client, status: str) -> None:
+    """Send a status embed to the configured STATUS_CHANNEL_ID."""
+    raw_id = os.getenv("STATUS_CHANNEL_ID")
+    if not raw_id:
+        log.error("STATUS_CHANNEL_ID is not set — skipping status message")
+        return
 
-    # 🔥 FIX 1: fetch channel instead of get_channel
-    channel = await bot.fetch_channel(channel_id)
+    try:
+        channel_id = int(raw_id)
+    except ValueError:
+        log.error("STATUS_CHANNEL_ID is not a valid integer: %r", raw_id)
+        return
 
-    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-    info = get_system_info()
+    now = datetime.now(IST)
 
-    if status == "start":
-        color = discord.Color.green()
-        title = "🟢 Bot Online"
-        description = "Bot has started successfully."
-    elif status == "stop":
-        color = discord.Color.red()
-        title = "🔴 Bot Offline"
-        description = "Bot has been stopped."
-    elif status == "crash":
-        color = discord.Color.orange()
-        title = "🟠 Bot Crashed"
-        description = "Bot has crashed and is restarting."
-    else:
-        color = discord.Color.blurple()
-        title = "🔵 Bot Status"
-        description = status
+    color, title, description = _STATUS_CONFIG.get(
+        status,
+        (discord.Color.blurple(), "🔵 Bot Status", status),
+    )
 
     embed = discord.Embed(
         title=title,
         description=description,
         color=color,
-        timestamp=datetime.now(IST)
+        timestamp=now,
     )
+    embed.add_field(name="🕐 Time (IST)", value=now.strftime("%Y-%m-%d %H:%M:%S"), inline=True)
+    for name, value, inline in _system_fields():
+        embed.add_field(name=name, value=value, inline=inline)
 
-    embed.add_field(name="🕐 Time", value=now, inline=True)
-    embed.add_field(name="⚙️ CPU", value=info["cpu"], inline=False)
-    embed.add_field(name="🧠 RAM", value=info["ram"], inline=False)
+    avatar_url = bot.user.display_avatar.url if bot.user else None
+    embed.set_footer(text="ZO Bot", icon_url=avatar_url)
 
-    # 🔥 FIX 2: safe avatar access
-    avatar_url = None
-    if bot.user and bot.user.display_avatar:
-        avatar_url = bot.user.display_avatar.url
-
-    if avatar_url:
-        embed.set_footer(text="ZO Bot", icon_url=avatar_url)
-    else:
-        embed.set_footer(text="ZO Bot")
-
-    await channel.send(embed=embed)
+    try:
+        channel = await bot.fetch_channel(channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            log.error("Channel %d is not a text channel — cannot send status", channel_id)
+            return
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        log.error("Missing permissions to send in channel %d", channel_id)
+    except discord.NotFound:
+        log.error("Status channel %d not found", channel_id)
+    except discord.HTTPException:
+        log.exception("Failed to send status embed to channel %d", channel_id)

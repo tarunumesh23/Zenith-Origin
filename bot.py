@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import db.database as database
 from db.migrations import run_migrations
 from ui.status import send_status
@@ -56,8 +57,9 @@ bot = commands.Bot(
     help_command=None,
 )
 
-_ready   = False  # guard against on_ready firing on reconnects
-_started = False  # True only after on_ready fully completes
+_ready      = False                  # guard against on_ready firing on reconnects
+_started    = False                  # True only after on_ready fully completes
+_start_time: float | None = None     # monotonic time when startup completed
 
 # ---------------------------------------------------------------------------
 # Global check
@@ -98,7 +100,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready() -> None:
-    global _ready, _started
+    global _ready, _started, _start_time
     if _ready:
         log.warning("on_ready fired again (reconnect) — skipping re-initialisation")
         return
@@ -156,9 +158,9 @@ async def on_ready() -> None:
     log.info("Slash cmds  » Synced")
     log.info("=" * 40)
 
-    # Mark startup as complete BEFORE sending status so _shutdown()
-    # can only send "stop" if this line has been reached.
-    _started = True
+    # Mark startup complete and record time BEFORE sending status
+    _started    = True
+    _start_time = time.monotonic()
     await send_status(bot, "start")
 
 # ---------------------------------------------------------------------------
@@ -167,8 +169,11 @@ async def on_ready() -> None:
 async def _shutdown() -> None:
     log.info("Shutting down...")
     try:
-        if _started:
+        uptime = time.monotonic() - _start_time if _start_time else 0
+        if _started and uptime > 30:
             await send_status(bot, "stop")
+        else:
+            log.info("Skipping stop status — uptime %.1fs is too short (redeploy)", uptime)
         await database.disconnect()
     except Exception:
         log.exception("Error during shutdown cleanup")

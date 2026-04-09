@@ -66,9 +66,13 @@ async def has_passed(discord_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 async def set_affinity(discord_id: int, affinity: str) -> None:
-    """Set elemental affinity once on first cultivation."""
+    """Set elemental affinity. Only applies if affinity has not been chosen yet."""
     await execute(
-        "UPDATE cultivators SET affinity = %s WHERE discord_id = %s AND affinity IS NULL",
+        """
+        UPDATE cultivators
+        SET affinity = %s
+        WHERE discord_id = %s AND affinity = 'water'
+        """,
         (affinity, discord_id),
     )
 

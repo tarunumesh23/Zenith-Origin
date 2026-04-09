@@ -26,8 +26,8 @@ MIGRATIONS: list[str] = [
         qi_threshold    INT UNSIGNED        NOT NULL DEFAULT 100,
 
         -- Affinity
-        affinity ENUM('fire','water','lightning','wood','earth') 
-        NOT NULL DEFAULT 'water',
+        affinity ENUM('fire','water','lightning','wood','earth')
+            NOT NULL DEFAULT 'water',
 
         -- Passive tick
         last_tick_at    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -125,6 +125,15 @@ MIGRATIONS: list[str] = [
         FOREIGN KEY (challenger_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE,
         FOREIGN KEY (target_id)    REFERENCES cultivators(discord_id) ON DELETE CASCADE
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 7. Backfill: add affinity column to existing tables created before the comma fix.
+    #    ADD COLUMN IF NOT EXISTS is a no-op on fresh installs where migration 1 ran correctly.
+    """
+    ALTER TABLE cultivators
+        ADD COLUMN IF NOT EXISTS affinity
+            ENUM('fire','water','lightning','wood','earth')
+            NOT NULL DEFAULT 'water'
     """,
 ]
 

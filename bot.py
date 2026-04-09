@@ -10,6 +10,7 @@ import sys
 import time
 import db.database as database
 from db.migrations import run_migrations
+from db.cultivators import has_passed
 from ui.status import send_status
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,9 @@ OWNER_ID         = int(os.getenv("OWNER_ID", "0"))
 
 EXCLUDED_FOLDERS = {"ui", "__pycache__"}
 
+# Commands that don't require registration to use
+UNREGISTERED_ALLOWED = {"start"}
+
 # ---------------------------------------------------------------------------
 # Bot setup
 # ---------------------------------------------------------------------------
@@ -57,20 +61,43 @@ bot = commands.Bot(
     help_command=None,
 )
 
-_ready      = False                  # guard against on_ready firing on reconnects
-_started    = False                  # True only after on_ready fully completes
-_start_time: float | None = None     # monotonic time when startup completed
+_ready      = False
+_started    = False
+_start_time: float | None = None
 
 # ---------------------------------------------------------------------------
 # Global check
 # ---------------------------------------------------------------------------
 @bot.check
 async def global_check(ctx: commands.Context) -> bool:
+    # Owner bypasses everything
     if ctx.author.id == OWNER_ID:
         return True
-    if not REQUIRE_ROLE:
+
+    # Role gate
+    if REQUIRE_ROLE and not any(role.id == REQUIRED_ROLE_ID for role in ctx.author.roles):
+        return False
+
+    # Allow unregistered commands freely
+    if ctx.command and ctx.command.name in UNREGISTERED_ALLOWED:
         return True
-    return any(role.id == REQUIRED_ROLE_ID for role in ctx.author.roles)
+
+    # Registration gate — must have passed the intro trial
+    if not await has_passed(ctx.author.id):
+        await ctx.send(
+            embed=discord.Embed(
+                title="⛩️ The Path is Sealed",
+                description=(
+                    "You have not yet proven yourself to the Dao.\n\n"
+                    "Use `z!start` to begin your trial and earn the right to cultivate."
+                ),
+                color=discord.Color.dark_red(),
+            ),
+            ephemeral=True,
+        )
+        return False
+
+    return True
 
 # ---------------------------------------------------------------------------
 # Error handler
@@ -88,9 +115,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         return
 
     if isinstance(error, commands.CheckFailure):
-        msg = await ctx.send("❌ You need the required role to use this bot.")
-        await asyncio.sleep(5)
-        await msg.delete()
+        # Silent fail — the global_check already sent a message if needed
         return
 
     raise error
@@ -158,7 +183,6 @@ async def on_ready() -> None:
     log.info("Slash cmds  » Synced")
     log.info("=" * 40)
 
-    # Mark startup complete and record time BEFORE sending status
     _started    = True
     _start_time = time.monotonic()
     await send_status(bot, "start")
@@ -169,7 +193,6 @@ async def on_ready() -> None:
 async def _shutdown() -> None:
     log.info("Shutting down...")
     try:
-        # DO NOT send "stop" on SIGTERM (this is usually a restart)
         await database.disconnect()
     except Exception:
         log.exception("Error during shutdown cleanup")
@@ -182,10 +205,9 @@ def _handle_signal(signum, _frame) -> None:
 @bot.command()
 @commands.is_owner()
 async def sync(ctx):
-    bot.tree.clear_commands(guild=None)  # clears global commands
+    bot.tree.clear_commands(guild=None)
     await bot.tree.sync()
     await ctx.send("Synced and cleared global commands.")
-
 
 # ---------------------------------------------------------------------------
 # Entry point

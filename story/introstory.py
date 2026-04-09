@@ -107,11 +107,10 @@ class SceneView(discord.ui.View):
         self.scene_index = scene_index
         self.score = score
 
-        scene = SCENES[scene_index]
-        for i, choice in enumerate(scene["choices"]):
+        for i, choice in enumerate(SCENES[scene_index]["choices"]):
             btn = discord.ui.Button(
                 label=choice["label"],
-                style=discord.ButtonStyle.primary if i == 0 else discord.ButtonStyle.secondary,
+                style=discord.ButtonStyle.primary,
                 custom_id=str(i)
             )
             btn.callback = self._make_callback(i)
@@ -123,26 +122,26 @@ class SceneView(discord.ui.View):
                 await interaction.response.send_message("This isn't your journey.", ephemeral=True)
                 return
 
-            for item in self.children:
-                item.disabled = True
-            await interaction.response.edit_message(view=self)
-
             choice = SCENES[self.scene_index]["choices"][choice_index]
             new_score = self.score + choice["score"]
-
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    description=f"*{choice['response']}*",
-                    color=discord.Color.blurple()
-                )
-            )
-
             next_index = self.scene_index + 1
 
             if next_index < len(SCENES):
-                await self.cog.send_scene(self.ctx, next_index, new_score, followup=interaction)
+                next_scene = SCENES[next_index]
+                embed = discord.Embed(
+                    title=next_scene["title"],
+                    description=(
+                        f"*{choice['response']}*\n\n"
+                        f"――――――――――――――――――――\n\n"
+                        f"{next_scene['description']}"
+                    ),
+                    color=discord.Color.dark_teal()
+                )
+                embed.set_footer(text=f"Scene {next_index + 1} of {len(SCENES)}")
+                next_view = SceneView(self.cog, self.ctx, next_index, new_score)
+                await interaction.response.edit_message(embed=embed, view=next_view)
             else:
-                await self.cog.send_outcome(self.ctx, new_score, followup=interaction)
+                await self.cog.send_outcome(self.ctx, new_score, interaction)
 
         return callback
 

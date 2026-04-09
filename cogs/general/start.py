@@ -6,6 +6,7 @@ from discord.ext import commands
 
 from story.introstory import SCENES, OUTCOMES, SceneView
 from db.cultivators import upsert_cultivator, has_passed
+from ui.embed import build_embed
 
 CULTIVATION_LOG_CHANNEL = int(os.getenv("CULTIVATION_LOG_CHANNEL", "0"))
 
@@ -20,12 +21,13 @@ class Start(commands.Cog):
     async def start(self, ctx: commands.Context) -> None:
         uid = ctx.author.id
 
-        # ── Block if already passed ──
         if await has_passed(uid):
             await ctx.send(
-                embed=discord.Embed(
-                    description="⚡ You have already walked the Path. There is no need to prove yourself again.",
-                    color=discord.Color.gold()
+                embed=build_embed(
+                    ctx,
+                    title="⚡ Already Awakened",
+                    description="You have already walked the Path. There is no need to prove yourself again.",
+                    color=discord.Color.gold(),
                 ),
                 ephemeral=True
             )
@@ -33,9 +35,11 @@ class Start(commands.Cog):
 
         if uid in self.active_users:
             await ctx.send(
-                embed=discord.Embed(
-                    description="⏳ You are already on your trial. Focus.",
-                    color=discord.Color.orange()
+                embed=build_embed(
+                    ctx,
+                    title="⏳ Trial In Progress",
+                    description="You are already on your trial. Focus.",
+                    color=discord.Color.orange(),
                 ),
                 ephemeral=True
             )
@@ -49,29 +53,29 @@ class Start(commands.Cog):
         ctx: commands.Context,
         scene_index: int,
         score: int,
-        followup: discord.Interaction | None = None
     ) -> None:
         scene = SCENES[scene_index]
 
-        embed = discord.Embed(
+        embed = build_embed(
+            ctx,
             title=scene["title"],
             description=scene["description"],
-            color=discord.Color.dark_teal()
+            color=discord.Color.dark_teal(),
+            show_footer=True,
         )
-        embed.set_footer(text=f"Scene {scene_index + 1} of {len(SCENES)}")
+        embed.set_footer(
+            text=f"Scene {scene_index + 1} of {len(SCENES)}  •  {ctx.author.display_name}",
+            icon_url=ctx.author.display_avatar.url,
+        )
 
         view = SceneView(self, ctx, scene_index, score)
-
-        if followup:
-            await followup.followup.send(embed=embed, view=view)
-        else:
-            await ctx.send(embed=embed, view=view)
+        await ctx.send(embed=embed, view=view)
 
     async def send_outcome(
         self,
         ctx: commands.Context,
         score: int,
-        followup: discord.Interaction
+        interaction: discord.Interaction,
     ) -> None:
         self.active_users.discard(ctx.author.id)
 
@@ -83,17 +87,21 @@ class Start(commands.Cog):
             key = "fail"
 
         outcome = OUTCOMES[key]
-        embed = discord.Embed(
+
+        embed = build_embed(
+            ctx,
             title=outcome["title"],
             description=f"{outcome['description']}\n\n**Final Score:** `{score}/10`",
-            color=outcome["color"]
+            color=outcome["color"],
+            show_footer=True,
         )
         embed.set_author(
             name=ctx.author.display_name,
-            icon_url=ctx.author.display_avatar.url
+            icon_url=ctx.author.display_avatar.url,
         )
 
-        await followup.followup.send(embed=embed)
+        # ── Edit the scene message into the outcome ──
+        await interaction.response.edit_message(embed=embed, view=None)
 
         # ── Save to database ──
         await upsert_cultivator(
@@ -113,15 +121,17 @@ class Start(commands.Cog):
         if channel is None:
             return
 
-        embed = discord.Embed(
+        embed = build_embed(
+            ctx,
             title="⚡ A New Cultivator Has Emerged",
             description=(
                 f"{ctx.author.mention} has proven themselves worthy.\n"
                 f"The Dao has opened its gates."
             ),
-            color=discord.Color.gold()
+            color=discord.Color.gold(),
+            thumbnail=ctx.author.display_avatar.url,
+            show_footer=True,
         )
-        embed.set_thumbnail(url=ctx.author.display_avatar.url)
         embed.set_footer(text=f"ID: {ctx.author.id}")
 
         await channel.send(embed=embed)

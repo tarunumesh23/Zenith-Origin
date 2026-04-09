@@ -193,12 +193,23 @@ async def on_ready() -> None:
 async def _shutdown() -> None:
     log.info("Shutting down...")
     try:
+        # Send stop status BEFORE closing the bot so the HTTP session is alive
+        await send_status(bot, "stop")
+    except Exception:
+        log.exception("Failed to send shutdown status")
+    try:
         await database.disconnect()
     except Exception:
         log.exception("Error during shutdown cleanup")
     await bot.close()
 
+_shutdown_triggered = False
+
 def _handle_signal(signum, _frame) -> None:
+    global _shutdown_triggered
+    if _shutdown_triggered:
+        return  # Prevent double-trigger on rapid signals
+    _shutdown_triggered = True
     log.info("Received signal %s", signal.Signals(signum).name)
     asyncio.get_running_loop().create_task(_shutdown())
 

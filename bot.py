@@ -179,6 +179,14 @@ def _handle_signal(signum, _frame) -> None:
     log.info("Received signal %s", signal.Signals(signum).name)
     asyncio.get_running_loop().create_task(_shutdown())
 
+@bot.command()
+@commands.is_owner()
+async def sync(ctx):
+    bot.tree.clear_commands(guild=None)  # clears global commands
+    await bot.tree.sync()
+    await ctx.send("Synced and cleared global commands.")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

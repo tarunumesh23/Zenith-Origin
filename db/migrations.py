@@ -8,26 +8,17 @@ from db.database import connect, disconnect, execute
 
 log = logging.getLogger("bot.migrations")
 
-# ---------------------------------------------------------------------------
-# Add CREATE TABLE / ALTER TABLE statements here.
-# Every statement must be idempotent (IF NOT EXISTS / IF NOT EXISTS column).
-# ---------------------------------------------------------------------------
 MIGRATIONS: list[str] = [
     """
-    CREATE TABLE IF NOT EXISTS users (
-        id         BIGINT PRIMARY KEY,
-        username   VARCHAR(100),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    CREATE TABLE IF NOT EXISTS cultivators (
+        discord_id      BIGINT UNSIGNED     NOT NULL PRIMARY KEY,
+        username        VARCHAR(100)        NOT NULL,
+        display_name    VARCHAR(100)        NOT NULL,
+        joined_at       DATETIME            NOT NULL,
+        registered_at   DATETIME            NOT NULL,
+        outcome         ENUM('pass','retry','fail') NOT NULL
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
-
-    # """
-    # CREATE TABLE IF NOT EXISTS economy (
-    #     user_id BIGINT PRIMARY KEY,
-    #     balance INT NOT NULL DEFAULT 0,
-    #     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    # ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
-    # """,
 ]
 
 

@@ -17,21 +17,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 # 🔘 Button View
 class InfoView(discord.ui.View):
-    def __init__(self, bot: commands.Bot):
+    def __init__(self):
         super().__init__(timeout=None)
-
-        invite_url = discord.utils.oauth_url(
-            bot.user.id,
-            permissions=discord.Permissions(8)  # admin perms (change if needed)
-        )
-
-        # Invite Button
-        self.add_item(discord.ui.Button(
-            label="Invite",
-            url=invite_url,
-            style=discord.ButtonStyle.link,
-            emoji="🔗"
-        ))
 
         # Support Button
         self.add_item(discord.ui.Button(
@@ -117,7 +104,7 @@ class Info(commands.Cog):
         )
 
         # 🔘 Send with buttons
-        await ctx.send(embed=embed, view=InfoView(bot))
+        await ctx.send(embed=embed, view=InfoView())
 
 
 async def setup(bot: commands.Bot) -> None:

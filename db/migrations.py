@@ -11,41 +11,47 @@ MIGRATIONS: list[str] = [
     # 1. Core cultivators table
     """
     CREATE TABLE IF NOT EXISTS cultivators (
-        discord_id      BIGINT UNSIGNED     NOT NULL PRIMARY KEY,
-        username        VARCHAR(100)        NOT NULL,
-        display_name    VARCHAR(100)        NOT NULL,
-        joined_at       DATETIME            NOT NULL,
-        registered_at   DATETIME            NOT NULL,
-        outcome         ENUM('pass','retry','fail') NOT NULL,
+    discord_id      BIGINT UNSIGNED     NOT NULL PRIMARY KEY,
+    username        VARCHAR(100)        NOT NULL,
+    display_name    VARCHAR(100)        NOT NULL,
+    joined_at       DATETIME            NOT NULL,
+    registered_at   DATETIME            NOT NULL,
+    outcome         ENUM('pass','retry','fail') NOT NULL,
 
-        -- Cultivation progression
-        realm           ENUM('mortal','qi_gathering','qi_condensation','qi_refining')
-                            NOT NULL DEFAULT 'mortal',
-        stage           TINYINT UNSIGNED    NOT NULL DEFAULT 1,
-        qi              INT UNSIGNED        NOT NULL DEFAULT 0,
-        qi_threshold    INT UNSIGNED        NOT NULL DEFAULT 100,
+    -- Cultivation progression
+    realm           ENUM('mortal','qi_gathering','qi_condensation','qi_refining')
+                        NOT NULL DEFAULT 'mortal',
+    stage           TINYINT UNSIGNED    NOT NULL DEFAULT 1,
+    qi              INT UNSIGNED        NOT NULL DEFAULT 0,
+    qi_threshold    INT UNSIGNED        NOT NULL DEFAULT 100,
 
-        -- Affinity
-        affinity ENUM('fire','water','lightning','wood','earth') 
-        NOT NULL DEFAULT 'water'
+    -- Affinity
+    affinity ENUM('fire','water','lightning','wood','earth') 
+        NOT NULL DEFAULT 'water',
 
-        -- Passive tick
-        last_tick_at    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Passive tick
+    last_tick_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-        -- Breakthrough state
-        in_tribulation          BOOLEAN     NOT NULL DEFAULT FALSE,
-        tribulation_started_at  DATETIME    DEFAULT NULL,
-        breakthrough_cooldown   DATETIME    DEFAULT NULL,
+    -- Breakthrough state
+    in_tribulation          BOOLEAN     NOT NULL DEFAULT FALSE,
+    tribulation_started_at  DATETIME    DEFAULT NULL,
 
-        -- Active buffs
-        closed_cult_until       DATETIME    DEFAULT NULL,
-        stabilise_used          BOOLEAN     NOT NULL DEFAULT FALSE,
+    -- PvP debuffs & defences
+    breakthrough_cooldown   DATETIME    DEFAULT NULL,
+    ward_until              DATETIME    DEFAULT NULL,
+    crippled_until          DATETIME    DEFAULT NULL,
 
-        -- PvP stats
-        reputation      SMALLINT            NOT NULL DEFAULT 0,
-        total_wins      SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
-        total_losses    SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
-        fled_challenges SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+    -- Active buffs
+    foundation_bonus        SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+
+    closed_cult_until       DATETIME    DEFAULT NULL,
+    stabilise_used          BOOLEAN     NOT NULL DEFAULT FALSE,
+
+    -- PvP stats
+    reputation      SMALLINT            NOT NULL DEFAULT 0,
+    total_wins      SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+    total_losses    SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+    fled_challenges SMALLINT UNSIGNED   NOT NULL DEFAULT 0
 
         -- PvP debuffs & defences
         ward_until              DATETIME    DEFAULT NULL,

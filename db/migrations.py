@@ -143,7 +143,11 @@ async def run_migrations() -> None:
         try:
             await execute(query)
             log.debug("Migration %d/%d OK", i, len(MIGRATIONS))
-        except Exception:
+        except Exception as e:
+            # 1060 = Duplicate column name — safe to ignore for ADD COLUMN backfills
+            if hasattr(e, 'args') and e.args[0] == 1060:
+                log.debug("Migration %d/%d skipped — column already exists", i, len(MIGRATIONS))
+                continue
             log.exception("Migration %d/%d FAILED — query:\n%s", i, len(MIGRATIONS), query.strip())
             raise
 

@@ -6,6 +6,11 @@ from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 
+from cultivation.constants import (
+    AFFINITY_DISPLAY,
+    REALM_DISPLAY,
+    get_reputation_title,
+)
 from db.cultivators import get_cultivator
 from ui.embed import build_embed, error_embed
 
@@ -18,7 +23,7 @@ log = logging.getLogger("bot.cogs.profile")
 
 def _cultivation_age(registered_at: datetime) -> str:
     """
-    1 real hour   = 1 cultivation year
+    2 real hours  = 1 cultivation year
     1 real minute = 1 cultivation month
     1 real second = 1 cultivation day
     """
@@ -28,8 +33,8 @@ def _cultivation_age(registered_at: datetime) -> str:
     elapsed       = datetime.now(timezone.utc) - registered_at
     total_seconds = max(int(elapsed.total_seconds()), 0)
 
-    years   = total_seconds // 3600
-    months  = (total_seconds % 3600) // 60
+    years   = total_seconds // 7200
+    months  = (total_seconds % 7200) // 60
     days    = total_seconds % 60
 
     parts: list[str] = []
@@ -43,22 +48,77 @@ def _cultivation_age(registered_at: datetime) -> str:
     return ", ".join(parts) if parts else "**0** days"
 
 
+def _qi_bar(qi: int, threshold: int, length: int = 10) -> str:
+    """Visual Qi progress bar."""
+    filled = round((qi / threshold) * length) if threshold else 0
+    return "█" * filled + "░" * (length - filled)
+
+
 def _build_profile_embed(
     ctx: commands.Context,
     target: discord.Member,
     row: dict,
 ) -> discord.Embed:
-    age = _cultivation_age(row["registered_at"])
+    age      = _cultivation_age(row["registered_at"])
+    realm    = REALM_DISPLAY.get(row["realm"], row["realm"])
+    affinity = AFFINITY_DISPLAY.get(row["affinity"], "None") if row["affinity"] else "*Not chosen*"
+    qi       = row["qi"]
+    thresh   = row["qi_threshold"]
+    bar      = _qi_bar(qi, thresh)
+    rep      = row["reputation"]
+    title_   = get_reputation_title(rep)
+
+    tribulation_note = ""
+    if row["in_tribulation"]:
+        tribulation_note = "\n\n⚡ *Tribulation looms. Use `/breakthrough` before your energy destabilises.*"
+
+    closed_note = ""
+    if row["closed_cult_until"]:
+        from datetime import timezone as tz
+        until = row["closed_cult_until"]
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=tz.utc)
+        from datetime import datetime as dt
+        if until > dt.now(tz.utc):
+            closed_note = f"\n🔒 *In closed cultivation until <t:{int(until.timestamp())}:t>*"
 
     embed = build_embed(
         ctx,
         title=f"⚡ {target.display_name}",
-        description="*A soul walking the endless Path of Cultivation.*",
+        description=(
+            f"*A soul walking the endless Path of Cultivation.*"
+            f"{tribulation_note}{closed_note}"
+        ),
         color=discord.Color.dark_teal(),
         fields=[
             {
-                "name": "👤 Name",
+                "name": "👤 Cultivator",
                 "value": f"`{target.display_name}`",
+                "inline": True,
+            },
+            {
+                "name": "🌀 Realm & Stage",
+                "value": f"`{realm} — Stage {row['stage']}`",
+                "inline": True,
+            },
+            {
+                "name": "⚗️ Affinity",
+                "value": affinity,
+                "inline": True,
+            },
+            {
+                "name": "💠 Qi",
+                "value": f"`{qi} / {thresh}`\n{bar}",
+                "inline": True,
+            },
+            {
+                "name": "🏆 Reputation",
+                "value": f"`{rep}` — *{title_}*",
+                "inline": True,
+            },
+            {
+                "name": "⚔️ Record",
+                "value": f"`{row['total_wins']}W / {row['total_losses']}L`",
                 "inline": True,
             },
             {
@@ -95,58 +155,34 @@ class Profile(commands.Cog):
     ) -> None:
         target = member or ctx.author
 
-        # Defer for slash command responsiveness
         if ctx.interaction:
             await ctx.interaction.response.defer()
 
-        # Fetch from DB
         try:
             row = await get_cultivator(target.id)
         except Exception:
             log.exception("Profile » DB fetch failed for discord_id=%s", target.id)
             await ctx.send(
-                embed=error_embed(
-                    ctx,
-                    title="Database Error",
-                    description="Could not fetch profile data. Please try again later.",
-                ),
+                embed=error_embed(ctx, title="Database Error",
+                                  description="Could not fetch profile data. Please try again later."),
                 ephemeral=True,
             )
             return
 
-        # Not registered
         if row is None:
-            if target == ctx.author:
-                desc = "You have not yet walked the Path. Use `z!start` to begin your trial."
-            else:
-                desc = f"{target.mention} has not yet walked the Path."
-
+            desc = (
+                "You have not yet walked the Path. Use `z!start` to begin your trial."
+                if target == ctx.author
+                else f"{target.mention} has not yet walked the Path."
+            )
             await ctx.send(
-                embed=error_embed(
-                    ctx,
-                    title="Not a Cultivator",
-                    description=desc,
-                ),
+                embed=error_embed(ctx, title="Not a Cultivator", description=desc),
                 ephemeral=True,
             )
             return
 
-        # Build and send embed
-        try:
-            embed = _build_profile_embed(ctx, target, row)
-        except Exception:
-            log.exception("Profile » Failed to build embed for discord_id=%s", target.id)
-            await ctx.send(
-                embed=error_embed(
-                    ctx,
-                    title="Error",
-                    description="Something went wrong while building the profile. Please try again.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        log.info("Profile » %s viewed profile of %s", ctx.author, target)
+        embed = _build_profile_embed(ctx, target, row)
+        log.debug("Profile » %s viewed profile of %s", ctx.author, target)
         await ctx.send(embed=embed)
 
 

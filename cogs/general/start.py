@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 
 import discord
 from discord.ext import commands
 
-from db.cultivators import has_passed, upsert_cultivator
+from db.cultivators import has_passed, set_affinity, upsert_cultivator
 from story.introstory import OUTCOMES, SCENES, STORY_BANNER_URL, SceneView, _build_scene_embed
+from cultivation.constants import AFFINITIES, AFFINITY_DISPLAY
 from ui.embed import build_embed
 
 log = logging.getLogger("bot.cogs.start")
@@ -17,7 +19,7 @@ CULTIVATION_LOG_CHANNEL = int(os.getenv("CULTIVATION_LOG_CHANNEL", "0"))
 
 class Start(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
-        self.bot         = bot
+        self.bot = bot
         self.active_users: set[int] = set()
 
     # ------------------------------------------------------------------
@@ -69,7 +71,7 @@ class Start(commands.Cog):
     ) -> None:
         scene = SCENES[scene_index]
         embed = _build_scene_embed(ctx, scene_index, scene["description"])
-        view  = SceneView(self, ctx, scene_index, score)
+        view = SceneView(self, ctx, scene_index, score)
         await ctx.send(embed=embed, view=view)
 
     async def send_outcome(
@@ -89,10 +91,18 @@ class Start(commands.Cog):
 
         outcome = OUTCOMES[key]
 
+        # Roll affinity once — same value shown in embed and written to DB
+        affinity: str | None = random.choice(AFFINITIES) if key == "pass" else None
+
+        affinity_line = (
+            f"\n\n**Elemental Affinity Awakened:** {AFFINITY_DISPLAY[affinity]}"
+            if affinity else ""
+        )
+
         embed = build_embed(
             ctx,
             title=outcome["title"],
-            description=f"{outcome['description']}\n\n**Final Score:** `{score}/10`",
+            description=f"{outcome['description']}{affinity_line}\n\n**Final Score:** `{score}/10`",
             color=outcome["color"],
             show_footer=True,
         )
@@ -115,26 +125,33 @@ class Start(commands.Cog):
                 joined_at=ctx.author.joined_at or ctx.author.created_at,
                 outcome=key,
             )
+            if affinity:
+                await set_affinity(ctx.author.id, affinity)
         except Exception:
             log.exception("Story » Failed to upsert cultivator %s", ctx.author.id)
 
-        log.info("Story » %s finished trial — outcome=%s score=%d", ctx.author, key, score)
+        log.info("Story » %s finished trial — outcome=%s score=%d affinity=%s", ctx.author, key, score, affinity)
 
         if key == "pass":
-            await self._log_cultivator(ctx)
+            await self._log_cultivator(ctx, affinity)
 
-    async def _log_cultivator(self, ctx: commands.Context) -> None:
+    async def _log_cultivator(self, ctx: commands.Context, affinity: str | None = None) -> None:
         channel = self.bot.get_channel(CULTIVATION_LOG_CHANNEL)
         if channel is None:
             log.warning("Story » CULTIVATION_LOG_CHANNEL %d not found", CULTIVATION_LOG_CHANNEL)
             return
+
+        affinity_line = (
+            f"\nElemental Affinity: {AFFINITY_DISPLAY[affinity]}"
+            if affinity else ""
+        )
 
         embed = build_embed(
             ctx,
             title="⚡ A New Cultivator Has Emerged",
             description=(
                 f"{ctx.author.mention} has proven themselves worthy.\n"
-                "The Dao has opened its gates."
+                f"The Dao has opened its gates.{affinity_line}"
             ),
             color=discord.Color.gold(),
             thumbnail=ctx.author.display_avatar.url,

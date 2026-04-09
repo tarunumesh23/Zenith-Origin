@@ -30,6 +30,7 @@ async def connect() -> None:
         minsize=1,
         maxsize=10,
         charset="utf8mb4",
+        auth_plugin="mysql_native_password",  # ← fix for caching_sha2_password error
     )
 
     log.info("Database    » Connected  (host=%s db=%s)", url.hostname, url.path.lstrip("/"))

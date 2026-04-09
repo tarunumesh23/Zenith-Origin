@@ -126,15 +126,6 @@ MIGRATIONS: list[str] = [
         FOREIGN KEY (target_id)    REFERENCES cultivators(discord_id) ON DELETE CASCADE
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
-
-    # 7. Backfill: add affinity column to existing tables created before the comma fix.
-    #    ADD COLUMN IF NOT EXISTS is a no-op on fresh installs where migration 1 ran correctly.
-    """
-    ALTER TABLE cultivators
-        ADD COLUMN IF NOT EXISTS affinity
-            ENUM('fire','water','lightning','wood','earth')
-            NOT NULL DEFAULT 'water'
-    """,
 ]
 
 
@@ -143,11 +134,7 @@ async def run_migrations() -> None:
         try:
             await execute(query)
             log.debug("Migration %d/%d OK", i, len(MIGRATIONS))
-        except Exception as e:
-            # 1060 = Duplicate column name — safe to ignore for ADD COLUMN backfills
-            if hasattr(e, 'args') and e.args[0] == 1060:
-                log.debug("Migration %d/%d skipped — column already exists", i, len(MIGRATIONS))
-                continue
+        except Exception:
             log.exception("Migration %d/%d FAILED — query:\n%s", i, len(MIGRATIONS), query.strip())
             raise
 

@@ -26,7 +26,8 @@ MIGRATIONS: list[str] = [
         qi_threshold    INT UNSIGNED        NOT NULL DEFAULT 100,
 
         -- Affinity
-        affinity        ENUM('fire','water','lightning','wood','earth') DEFAULT NULL,
+        affinity ENUM('fire','water','lightning','wood','earth') 
+        NOT NULL DEFAULT 'water'
 
         -- Passive tick
         last_tick_at    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,

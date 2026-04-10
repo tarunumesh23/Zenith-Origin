@@ -25,12 +25,13 @@ MIGRATIONS: list[str] = [
         qi              INT UNSIGNED        NOT NULL DEFAULT 0,
         qi_threshold    INT UNSIGNED        NOT NULL DEFAULT 100,
 
-        -- Affinity
+        -- Affinity (NULL = not yet chosen)
         affinity ENUM('fire','water','lightning','wood','earth')
-            NOT NULL DEFAULT 'water',
+            NULL DEFAULT NULL,
 
-        -- Passive tick
-        last_tick_at    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        -- Real-time Qi accrual: qi is the stored value at last_updated;
+        -- current Qi is computed as min(qi + rate * elapsed, qi_threshold).
+        last_updated    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
         -- Breakthrough state
         in_tribulation          BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -125,6 +126,49 @@ MIGRATIONS: list[str] = [
         FOREIGN KEY (challenger_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE,
         FOREIGN KEY (target_id)    REFERENCES cultivators(discord_id) ON DELETE CASCADE
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 7. ALTER existing cultivators table for installs that ran migrations 1-6
+    #    before this patch.  Both statements are safe to re-run:
+    #      - ADD COLUMN IF NOT EXISTS is a no-op if the column already exists.
+    #      - MODIFY COLUMN is idempotent — it just resets the default.
+    #
+    #    last_tick_at is left untouched so no data is lost.
+    """
+    ALTER TABLE cultivators
+        ADD COLUMN IF NOT EXISTS last_updated DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            AFTER qi_threshold
+    """,
+
+    """
+    ALTER TABLE cultivators
+        MODIFY COLUMN affinity ENUM('fire','water','lightning','wood','earth')
+            NULL DEFAULT NULL
+    """,
+
+    # 8. Backfill last_updated for rows that were inserted before migration 7.
+    #    Sets last_updated = registered_at so accrual is calculated from when
+    #    the cultivator actually joined, not from epoch / NULL.
+    #    Rows that already have a non-default last_updated are left alone.
+    """
+    UPDATE cultivators
+    SET last_updated = registered_at
+    WHERE last_updated = '2000-01-01 00:00:00'
+       OR last_updated IS NULL
+    """,
+
+    # 9. Backfill affinity: rows that have the old DEFAULT 'water' but never
+    #    explicitly chose an affinity should be reset to NULL so the
+    #    /choose_affinity prompt appears for them.
+    #
+    #    WARNING: if any real cultivator legitimately chose Water before this
+    #    migration, their affinity will be wiped here.  If that is a concern,
+    #    skip this statement or narrow the WHERE clause with a date guard, e.g.:
+    #      AND registered_at >= '<date you deployed the affinity system>'
+    """
+    UPDATE cultivators
+    SET affinity = NULL
+    WHERE affinity = 'water'
     """,
 ]
 

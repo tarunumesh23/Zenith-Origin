@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TypedDict
+from typing import TypedDict, Union
 
 import discord
 import discord.ext.commands
 import pytz
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# build_embed accepts either a command Context or a raw Interaction so that
+# session.py and other non-command code can build embeds without a Context.
+_CtxOrInteraction = Union[discord.ext.commands.Context, discord.Interaction]
 
 
 class EmbedField(TypedDict, total=False):
@@ -16,8 +20,17 @@ class EmbedField(TypedDict, total=False):
     inline: bool
 
 
+def _author_info(ctx: _CtxOrInteraction) -> tuple[str, str]:
+    """Return (display_name, avatar_url) from either Context or Interaction."""
+    if isinstance(ctx, discord.ext.commands.Context):
+        user = ctx.author
+    else:
+        user = ctx.user
+    return user.display_name, user.display_avatar.url
+
+
 def build_embed(
-    ctx: discord.ext.commands.Context,
+    ctx: _CtxOrInteraction,
     *,
     title: str | None = None,
     description: str | None = None,
@@ -28,21 +41,6 @@ def build_embed(
     show_footer: bool = True,
     show_timestamp: bool = True,
 ) -> discord.Embed:
-    """
-    Build a reusable Discord embed.
-
-    Parameters
-    ----------
-    ctx             : Command context (used for requester info in footer)
-    title           : Embed title
-    description     : Embed description
-    color           : Embed color (default: blurple)
-    fields          : List of EmbedField dicts — keys: name, value, inline (optional)
-    thumbnail       : URL for thumbnail image
-    image           : URL for large image
-    show_footer     : Whether to show requester footer (default: True)
-    show_timestamp  : Whether to show IST timestamp (default: True)
-    """
     embed = discord.Embed(
         title=title,
         description=description,
@@ -50,24 +48,21 @@ def build_embed(
         timestamp=datetime.now(IST) if show_timestamp else None,
     )
 
-    for field in fields or []:
+    for f in fields or []:
         embed.add_field(
-            name=field.get("name", "\u200b"),
-            value=field.get("value", "\u200b"),
-            inline=field.get("inline", False),
+            name=f.get("name", "\u200b"),
+            value=f.get("value", "\u200b"),
+            inline=f.get("inline", False),
         )
 
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
-
     if image:
         embed.set_image(url=image)
 
     if show_footer:
-        embed.set_footer(
-            text=f"Requested by {ctx.author.display_name}",
-            icon_url=ctx.author.display_avatar.url,
-        )
+        name, avatar = _author_info(ctx)
+        embed.set_footer(text=f"Requested by {name}", icon_url=avatar)
 
     return embed
 
@@ -76,17 +71,17 @@ def build_embed(
 # Shorthand helpers
 # ---------------------------------------------------------------------------
 
-def success_embed(ctx: discord.ext.commands.Context, description: str, title: str = "Success") -> discord.Embed:
+def success_embed(ctx: _CtxOrInteraction, description: str, title: str = "Success") -> discord.Embed:
     return build_embed(ctx, title=f"✅  {title}", description=description, color=discord.Color.green())
 
 
-def error_embed(ctx: discord.ext.commands.Context, description: str, title: str = "Error") -> discord.Embed:
+def error_embed(ctx: _CtxOrInteraction, description: str, title: str = "Error") -> discord.Embed:
     return build_embed(ctx, title=f"❌  {title}", description=description, color=discord.Color.red())
 
 
-def info_embed(ctx: discord.ext.commands.Context, description: str, title: str = "Info") -> discord.Embed:
+def info_embed(ctx: _CtxOrInteraction, description: str, title: str = "Info") -> discord.Embed:
     return build_embed(ctx, title=f"ℹ️  {title}", description=description, color=discord.Color.blurple())
 
 
-def warning_embed(ctx: discord.ext.commands.Context, description: str, title: str = "Warning") -> discord.Embed:
+def warning_embed(ctx: _CtxOrInteraction, description: str, title: str = "Warning") -> discord.Embed:
     return build_embed(ctx, title=f"⚠️  {title}", description=description, color=discord.Color.yellow())

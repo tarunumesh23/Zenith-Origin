@@ -9,6 +9,20 @@ log = logging.getLogger("bot.database.cultivators")
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _now_naive() -> datetime:
+    """UTC now as a naive datetime (for MySQL storage)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _naive(dt: datetime) -> datetime:
+    """Strip tzinfo for MySQL storage."""
+    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -23,9 +37,10 @@ async def upsert_cultivator(
     await execute(
         """
         INSERT INTO cultivators
-            (discord_id, username, display_name, joined_at, registered_at, outcome)
+            (discord_id, username, display_name, joined_at, registered_at, outcome,
+             last_updated)
         VALUES
-            (%s, %s, %s, %s, %s, %s)
+            (%s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             username        = VALUES(username),
             display_name    = VALUES(display_name),
@@ -36,9 +51,10 @@ async def upsert_cultivator(
             discord_id,
             username,
             display_name,
-            joined_at.replace(tzinfo=None),
-            datetime.now(timezone.utc).replace(tzinfo=None),
+            _naive(joined_at),
+            _now_naive(),
             outcome,
+            _now_naive(),   # stamp last_updated so accrual starts from registration
         ),
     )
     log.info("Cultivators » Upserted discord_id=%s outcome=%s", discord_id, outcome)
@@ -66,48 +82,77 @@ async def has_passed(discord_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 async def set_affinity(discord_id: int, affinity: str) -> None:
-    """Set elemental affinity. Only applies if affinity has not been chosen yet."""
+    """
+    Set elemental affinity for the first time.
+    Works whether the stored value is NULL or 'water' (default).
+    Also stamps last_updated so accrual begins from this moment at the
+    correct affinity rate — avoids retroactively applying the new multiplier
+    to time elapsed before the choice was made.
+    """
     await execute(
         """
         UPDATE cultivators
-        SET affinity = %s
-        WHERE discord_id = %s AND affinity = 'water'
+        SET affinity     = %s,
+            last_updated = %s
+        WHERE discord_id = %s
+          AND (affinity IS NULL OR affinity = 'water')
         """,
-        (affinity, discord_id),
+        (affinity, _now_naive(), discord_id),
     )
 
 
 # ---------------------------------------------------------------------------
-# Qi & Passive Ticks
+# Qi — real-time accrual model
+#
+# Qi is NOT stored as a live counter.  The DB holds:
+#   qi           — Qi value at the moment of the last flush
+#   last_updated — UTC timestamp of that flush
+#
+# Current Qi at any moment is computed by cultivate.py as:
+#   current = min(qi + rate * elapsed_seconds, qi_threshold)
+#
+# set_qi() is called whenever we need to persist the computed value
+# (before any write that changes Qi, rate, or threshold).
 # ---------------------------------------------------------------------------
 
-async def add_qi(discord_id: int, amount: int) -> dict:
+async def set_qi(discord_id: int, qi: int, as_of: datetime) -> dict:
     """
-    Add Qi to a cultivator. Returns the updated row.
-    Caps Qi at qi_threshold (entering tribulation state).
+    Persist a flushed Qi value and stamp last_updated.
+    Returns the updated row.
     """
     await execute(
         """
         UPDATE cultivators
-        SET qi = LEAST(qi + %s, qi_threshold)
+        SET qi           = %s,
+            last_updated = %s
         WHERE discord_id = %s
         """,
-        (amount, discord_id),
+        (qi, _naive(as_of), discord_id),
     )
     return await fetch_one("SELECT * FROM cultivators WHERE discord_id = %s", (discord_id,))
 
 
-async def update_tick(discord_id: int) -> None:
-    """Stamp last_tick_at to now."""
+async def add_qi(discord_id: int, amount: int) -> dict:
+    """
+    Add a discrete Qi bonus on top of the already-flushed qi value
+    (e.g. meditation burst).  Caps at qi_threshold.
+    Stamps last_updated so the next accrual window starts clean.
+    Returns the updated row.
+
+    IMPORTANT: call _flush_qi() in the cog before calling this so that
+    the stored qi is already current — otherwise the burst is added to a
+    stale baseline.
+    """
     await execute(
-        "UPDATE cultivators SET last_tick_at = %s WHERE discord_id = %s",
-        (datetime.now(timezone.utc).replace(tzinfo=None), discord_id),
+        """
+        UPDATE cultivators
+        SET qi           = LEAST(qi + %s, qi_threshold),
+            last_updated = %s
+        WHERE discord_id = %s
+        """,
+        (amount, _now_naive(), discord_id),
     )
-
-
-async def get_all_cultivators() -> list[dict]:
-    """Return all cultivators for passive tick processing."""
-    return await fetch_all("SELECT * FROM cultivators WHERE outcome = 'pass'")
+    return await fetch_one("SELECT * FROM cultivators WHERE discord_id = %s", (discord_id,))
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +162,19 @@ async def get_all_cultivators() -> list[dict]:
 async def set_closed_cultivation(discord_id: int, until: datetime) -> None:
     await execute(
         "UPDATE cultivators SET closed_cult_until = %s WHERE discord_id = %s",
-        (until.replace(tzinfo=None), discord_id),
+        (_naive(until), discord_id),
     )
 
 
 async def clear_closed_cultivation(discord_id: int) -> None:
     await execute(
-        "UPDATE cultivators SET closed_cult_until = NULL WHERE discord_id = %s",
-        (discord_id,),
+        """
+        UPDATE cultivators
+        SET closed_cult_until = NULL,
+            last_updated      = %s
+        WHERE discord_id = %s
+        """,
+        (_now_naive(), discord_id),
     )
 
 
@@ -137,10 +187,11 @@ async def enter_tribulation(discord_id: int) -> None:
     await execute(
         """
         UPDATE cultivators
-        SET in_tribulation = TRUE, tribulation_started_at = %s
+        SET in_tribulation        = TRUE,
+            tribulation_started_at = %s
         WHERE discord_id = %s
         """,
-        (datetime.now(timezone.utc).replace(tzinfo=None), discord_id),
+        (_now_naive(), discord_id),
     )
 
 
@@ -149,7 +200,8 @@ async def exit_tribulation(discord_id: int) -> None:
     await execute(
         """
         UPDATE cultivators
-        SET in_tribulation = FALSE, tribulation_started_at = NULL
+        SET in_tribulation         = FALSE,
+            tribulation_started_at = NULL
         WHERE discord_id = %s
         """,
         (discord_id,),
@@ -159,7 +211,7 @@ async def exit_tribulation(discord_id: int) -> None:
 async def set_breakthrough_cooldown(discord_id: int, until: datetime) -> None:
     await execute(
         "UPDATE cultivators SET breakthrough_cooldown = %s WHERE discord_id = %s",
-        (until.replace(tzinfo=None), discord_id),
+        (_naive(until), discord_id),
     )
 
 
@@ -173,6 +225,7 @@ REALM_ORDER = ["mortal", "qi_gathering", "qi_condensation", "qi_refining"]
 async def advance_stage(discord_id: int, row: dict) -> dict:
     """
     Advance cultivator by one stage. Handles realm transitions.
+    Resets qi to 0 and stamps last_updated so accrual restarts cleanly.
     Returns updated row.
     """
     realm = row["realm"]
@@ -182,10 +235,8 @@ async def advance_stage(discord_id: int, row: dict) -> dict:
         new_stage = stage + 1
         new_realm = realm
     else:
-        # Realm transition
         current_index = REALM_ORDER.index(realm)
         if current_index + 1 >= len(REALM_ORDER):
-            # Already at max realm/stage — do nothing (future realms not yet implemented)
             return row
         new_realm = REALM_ORDER[current_index + 1]
         new_stage = 1
@@ -195,24 +246,32 @@ async def advance_stage(discord_id: int, row: dict) -> dict:
     await execute(
         """
         UPDATE cultivators
-        SET realm = %s, stage = %s, qi = 0,
-            qi_threshold = %s, stabilise_used = FALSE
+        SET realm          = %s,
+            stage          = %s,
+            qi             = 0,
+            qi_threshold   = %s,
+            stabilise_used = FALSE,
+            last_updated   = %s
         WHERE discord_id = %s
         """,
-        (new_realm, new_stage, new_threshold, discord_id),
+        (new_realm, new_stage, new_threshold, _now_naive(), discord_id),
     )
     return await fetch_one("SELECT * FROM cultivators WHERE discord_id = %s", (discord_id,))
 
 
 async def apply_qi_loss(discord_id: int, percent: float) -> None:
-    """Deduct a percentage of current Qi."""
+    """
+    Deduct a percentage of current Qi after a failed breakthrough.
+    Stamps last_updated so accrual resumes from the reduced value.
+    """
     await execute(
         """
         UPDATE cultivators
-        SET qi = GREATEST(FLOOR(qi * %s), 0)
+        SET qi           = GREATEST(FLOOR(qi * %s), 0),
+            last_updated = %s
         WHERE discord_id = %s
         """,
-        (1.0 - percent, discord_id),
+        (1.0 - percent, _now_naive(), discord_id),
     )
 
 
@@ -275,7 +334,7 @@ async def set_cooldown(discord_id: int, command: str, until: datetime) -> None:
         VALUES (%s, %s, %s)
         ON DUPLICATE KEY UPDATE expires_at = VALUES(expires_at)
         """,
-        (discord_id, command, until.replace(tzinfo=None)),
+        (discord_id, command, _naive(until)),
     )
 
 

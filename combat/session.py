@@ -22,8 +22,6 @@ Round resolution (simultaneous)
 Match winner = first to win 2 rounds (best-of-3).
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 from dataclasses import dataclass, field

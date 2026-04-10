@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from cultivation.constants import REALM_ORDER          # ← was: from db.cultivators import REALM_ORDER
 from db.database import execute, fetch_one, fetch_all
 
 log = logging.getLogger("bot.database.pvp")
@@ -166,8 +167,6 @@ async def apply_stage_loss(discord_id: int, row: dict) -> dict | None:
     Regress cultivator by one stage (Life-and-Death Duel loser penalty).
     Returns updated row or None if already at floor (mortal stage 1).
     """
-    from db.cultivators import REALM_ORDER
-
     realm = row["realm"]
     stage = row["stage"]
 
@@ -178,7 +177,7 @@ async def apply_stage_loss(discord_id: int, row: dict) -> dict | None:
         new_stage = stage - 1
         new_realm = realm
     else:
-        idx = REALM_ORDER.index(realm)
+        idx       = REALM_ORDER.index(realm)
         new_realm = REALM_ORDER[idx - 1]
         new_stage = 9
 

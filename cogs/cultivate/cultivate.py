@@ -561,12 +561,9 @@ class Cultivate(commands.Cog):
         if result.outcome == "success":
             color = discord.Color.gold() if result.overflow else discord.Color.green()
             title = "⚡ Qi Overflow — Double Advance!" if result.overflow else "✅ Breakthrough Success"
-        elif result.outcome == "minor_fail":
-            color = discord.Color.orange()
-            title = "⚠️ Breakthrough Failed"
-        else:
+        else:  # "fail"
             color = discord.Color.red()
-            title = "❌ Major Failure"
+            title = "❌ Breakthrough Failed"
 
         fields = [
             {

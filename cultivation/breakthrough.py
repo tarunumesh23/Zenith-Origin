@@ -18,7 +18,7 @@ from db import cultivators as db
 
 @dataclass
 class BreakthroughResult:
-    outcome:      str            # "success" | "minor_fail" | "major_fail"
+    outcome:      str            # "success" | "fail"
     overflow:     bool           # True if double-stage advance
     qi_lost:      int
     cooldown_end: datetime | None
@@ -38,23 +38,23 @@ async def attempt_breakthrough(row: dict) -> BreakthroughResult:
     Resolve a breakthrough attempt for the given cultivator row.
     Applies all DB side-effects (qi loss, stage advance, cooldown).
     Returns a BreakthroughResult describing what happened.
-    """
-    discord_id   = row["discord_id"]
-    realm        = row["realm"]
-    stage        = row["stage"]
-    affinity     = row["affinity"] or "water"
-    stabilise    = row["stabilise_used"]
-    current_qi   = row["qi"]
 
-    # --- Build adjusted odds ---
-    base_success, base_minor, base_major = BREAKTHROUGH_ODDS[realm]
-    affinity_mod = AFFINITY_BREAKTHROUGH_MODIFIER.get(affinity, 0.0)
-    stabilise_mod = 10.0 if not stabilise else 0.0   # stabilise not yet consumed = bonus
+    Failure policy: no realm or stage regression — only Qi loss + cooldown.
+    """
+    discord_id  = row["discord_id"]
+    realm       = row["realm"]
+    stage       = row["stage"]
+    affinity    = row["affinity"] or "water"
+    stabilise   = row["stabilise_used"]
+    current_qi  = row["qi"]
+
+    # --- Build adjusted success chance ---
+    base_success, _ = BREAKTHROUGH_ODDS[realm]
+    affinity_mod    = AFFINITY_BREAKTHROUGH_MODIFIER.get(affinity, 0.0)
+    # stabilise_used == False means the bonus is still available (not yet consumed)
+    stabilise_mod   = 10.0 if not stabilise else 0.0
 
     success_chance = min(base_success + affinity_mod + stabilise_mod, 97.0)
-    minor_chance   = base_minor
-    # major absorbs whatever is left
-    major_chance   = max(100.0 - success_chance - minor_chance, 0.0)
 
     roll = random.uniform(0, 100)
 
@@ -63,12 +63,11 @@ async def attempt_breakthrough(row: dict) -> BreakthroughResult:
 
     # --- Success ---
     if roll < success_chance:
-        # Qi Overflow: rare on high foundation — simplified here as a 5% extra roll on success
+        # Qi Overflow: 5% extra roll — advance two stages instead of one
         overflow = random.random() < 0.05
 
         updated = await db.advance_stage(discord_id, row)
         if overflow:
-            # Advance once more if not already at max
             updated = await db.advance_stage(discord_id, updated)
 
         await db.exit_tribulation(discord_id)
@@ -87,57 +86,29 @@ async def attempt_breakthrough(row: dict) -> BreakthroughResult:
             message=msg,
         )
 
-    # --- Minor Failure ---
-    elif roll < success_chance + minor_chance:
-        loss_pct, cd_minutes = FAIL_CONSEQUENCES[realm]["minor_fail"]
-        qi_lost = int(current_qi * loss_pct)
+    # --- Failure (no realm/stage loss) ---
+    loss_pct, cd_minutes = FAIL_CONSEQUENCES[realm]
+    qi_lost = int(current_qi * loss_pct)
 
-        await db.apply_qi_loss(discord_id, loss_pct)
-        await db.exit_tribulation(discord_id)
+    await db.apply_qi_loss(discord_id, loss_pct)
+    await db.exit_tribulation(discord_id)
 
-        cooldown_end = None
-        if cd_minutes:
-            cooldown_end = datetime.now(timezone.utc) + timedelta(minutes=cd_minutes)
-            await db.set_breakthrough_cooldown(discord_id, cooldown_end)
+    cooldown_end = datetime.now(timezone.utc) + timedelta(minutes=cd_minutes)
+    await db.set_breakthrough_cooldown(discord_id, cooldown_end)
 
-        await db.log_breakthrough(discord_id, realm, stage, "minor_fail", qi_lost=qi_lost)
+    await db.log_breakthrough(discord_id, realm, stage, "fail", qi_lost=qi_lost)
 
-        return BreakthroughResult(
-            outcome="minor_fail",
-            overflow=False,
-            qi_lost=qi_lost,
-            cooldown_end=cooldown_end,
-            realm_before=realm_before,
-            stage_before=stage_before,
-            realm_after=realm,
-            stage_after=stage,
-            message=_minor_fail_message(realm, affinity),
-        )
-
-    # --- Major Failure ---
-    else:
-        loss_pct, cd_minutes = FAIL_CONSEQUENCES[realm]["major_fail"]
-        qi_lost = int(current_qi * loss_pct)
-
-        await db.apply_qi_loss(discord_id, loss_pct)
-        await db.exit_tribulation(discord_id)
-
-        cooldown_end = datetime.now(timezone.utc) + timedelta(minutes=cd_minutes)
-        await db.set_breakthrough_cooldown(discord_id, cooldown_end)
-
-        await db.log_breakthrough(discord_id, realm, stage, "major_fail", qi_lost=qi_lost)
-
-        return BreakthroughResult(
-            outcome="major_fail",
-            overflow=False,
-            qi_lost=qi_lost,
-            cooldown_end=cooldown_end,
-            realm_before=realm_before,
-            stage_before=stage_before,
-            realm_after=realm,
-            stage_after=stage,
-            message=_major_fail_message(realm, affinity),
-        )
+    return BreakthroughResult(
+        outcome="fail",
+        overflow=False,
+        qi_lost=qi_lost,
+        cooldown_end=cooldown_end,
+        realm_before=realm_before,
+        stage_before=stage_before,
+        realm_after=realm,
+        stage_after=stage,
+        message=_fail_message(realm, affinity),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -160,29 +131,15 @@ def _success_message(realm: str, stage: int, overflow: bool) -> str:
     return f"✅ **Breakthrough!** {lines.get(realm, 'You advance.')}"
 
 
-def _minor_fail_message(realm: str, affinity: str) -> str:
+def _fail_message(realm: str, affinity: str) -> str:
     affinity_lines = {
-        "fire":      "Your flames burned too eagerly — the surge collapsed inward.",
-        "water":     "The current faltered. Your flow lost its rhythm at the critical moment.",
-        "lightning": "The bolt misfired. The discharge scattered before it could reshape your core.",
-        "wood":      "Your roots held, but the branch bent too far and snapped.",
-        "earth":     "The stone cracked under its own pressure. Stability was not enough.",
+        "fire":      "Your flames burned too eagerly — the surge collapsed inward. The tribulation dissipates, but your Qi scattered.",
+        "water":     "The current faltered at the final moment. Your flow broke and Qi drained away like a receding tide.",
+        "lightning": "The bolt misfired. The discharge scattered before it could reshape your core. The heavens are unimpressed.",
+        "wood":      "Your roots held, but the branch bent too far and snapped under tribulation pressure.",
+        "earth":     "The mountain cracked. Stability alone was not enough — the tribulation demanded more.",
     }
     return (
-        f"⚠️ **Minor Failure.** {affinity_lines.get(affinity, 'The attempt faltered.')} "
-        f"Some Qi was lost but the damage is shallow. Recover and try again."
-    )
-
-
-def _major_fail_message(realm: str, affinity: str) -> str:
-    affinity_lines = {
-        "fire":      "The inferno turned on itself. Your meridians scorched from within.",
-        "water":     "The tide reversed. Your gathered Qi drained away like water through broken stone.",
-        "lightning": "Overload. The discharge tore through your channels, leaving them frayed and weakened.",
-        "wood":      "The root system collapsed. Seasons of growth undone in a single moment.",
-        "earth":     "The mountain fell. What you spent so long building crumbled under tribulation pressure.",
-    }
-    return (
-        f"❌ **Major Failure.** {affinity_lines.get(affinity, 'The tribulation overwhelmed you.')} "
-        f"A significant portion of your Qi has scattered. You must wait before attempting again."
+        f"❌ **Breakthrough Failed.** {affinity_lines.get(affinity, 'The tribulation overwhelmed you.')} "
+        f"Your realm and stage are preserved. Recover your Qi and try again."
     )

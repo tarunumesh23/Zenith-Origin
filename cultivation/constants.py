@@ -15,41 +15,28 @@ REALM_ORDER = ["mortal", "qi_gathering", "qi_condensation", "qi_refining"]
 
 # ---------------------------------------------------------------------------
 # Breakthrough odds per realm
-# Single roll: (success%, minor_fail%, major_fail%)
-# No Qi Deviation in these early realms.
+# Single roll: (success%, fail%)
+# Failures never drop realm or stage — only Qi loss + cooldown.
 # ---------------------------------------------------------------------------
 
-BREAKTHROUGH_ODDS: dict[str, tuple[float, float, float]] = {
-    "mortal":          (90.0,  8.0,  2.0),
-    "qi_gathering":    (82.0, 13.0,  5.0),
-    "qi_condensation": (75.0, 18.0,  7.0),
-    "qi_refining":     (68.0, 22.0, 10.0),
+BREAKTHROUGH_ODDS: dict[str, tuple[float, float]] = {
+    "mortal":          (90.0, 10.0),
+    "qi_gathering":    (82.0, 18.0),
+    "qi_condensation": (75.0, 25.0),
+    "qi_refining":     (68.0, 32.0),
 }
 
 # ---------------------------------------------------------------------------
 # Failure consequences per realm
-# minor_fail  → (qi_loss_percent, cooldown_minutes)
-# major_fail  → (qi_loss_percent, cooldown_minutes)
-# No stage regression in early realms.
+# fail → (qi_loss_percent, cooldown_minutes)
+# No realm regression. No stage regression.
 # ---------------------------------------------------------------------------
 
-FAIL_CONSEQUENCES: dict[str, dict[str, tuple[float, int]]] = {
-    "mortal": {
-        "minor_fail": (0.10,  0),   # 10% Qi loss, no cooldown
-        "major_fail": (0.25, 30),   # 25% Qi loss, 30m cooldown
-    },
-    "qi_gathering": {
-        "minor_fail": (0.10,  0),
-        "major_fail": (0.25, 45),
-    },
-    "qi_condensation": {
-        "minor_fail": (0.10,  0),
-        "major_fail": (0.25, 60),
-    },
-    "qi_refining": {
-        "minor_fail": (0.10,  0),
-        "major_fail": (0.25, 60),
-    },
+FAIL_CONSEQUENCES: dict[str, tuple[float, int]] = {
+    "mortal":          (0.15, 10),   # 15% Qi loss, 10m cooldown
+    "qi_gathering":    (0.20, 20),   # 20% Qi loss, 20m cooldown
+    "qi_condensation": (0.25, 40),   # 25% Qi loss, 40m cooldown
+    "qi_refining":     (0.30, 60),   # 30% Qi loss, 60m cooldown
 }
 
 # ---------------------------------------------------------------------------
@@ -104,11 +91,13 @@ AFFINITY_MATCHUP: dict[str, dict[str, float]] = {
 
 # ---------------------------------------------------------------------------
 # Passive tick config
+# TARGET: ~0.40 Qi/sec base rate
+#   0.40 Qi/sec × 1800 sec = 720 Qi per tick
 # ---------------------------------------------------------------------------
 
-TICK_INTERVAL_SECONDS = 1800       # 30 minutes
-BASE_QI_PER_TICK      = 10         # before affinity multiplier
-CLOSED_CULT_MULTIPLIER = 2.0       # 2x Qi gain during closed cultivation
+TICK_INTERVAL_SECONDS  = 1800   # 30 minutes
+BASE_QI_PER_TICK       = 720    # ~0.40 Qi/sec (before affinity multiplier)
+CLOSED_CULT_MULTIPLIER = 2.0    # 2x Qi gain during closed cultivation
 
 # ---------------------------------------------------------------------------
 # Realm weight for combat power calculation

@@ -3,11 +3,53 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from db.database import connect, disconnect, execute
+from db.database import connect, disconnect, execute, fetch_one
 
 log = logging.getLogger("bot.migrations")
 
-MIGRATIONS: list[str] = [
+# ---------------------------------------------------------------------------
+# Migration list
+# Each entry is either:
+#   - a plain SQL string  → executed directly
+#   - a callable          → async def(total: int) -> None, handles its own logic
+#
+# The callable form is used for migrations that need conditional logic
+# (e.g. "ADD COLUMN only if it doesn't already exist") because MySQL does
+# not support ADD COLUMN IF NOT EXISTS — that syntax is MariaDB-only.
+# ---------------------------------------------------------------------------
+
+async def _migration_7(total: int) -> None:
+    """
+    Add last_updated column for installs that ran migrations 1-6
+    before this column was introduced.
+
+    MySQL does NOT support ADD COLUMN IF NOT EXISTS (that is MariaDB only).
+    We guard the ALTER at the Python level instead.
+    """
+    row = await fetch_one(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'cultivators'
+          AND COLUMN_NAME  = 'last_updated'
+        """
+    )
+    if row and row["cnt"]:
+        log.debug("Migration 7/%d SKIP — last_updated already exists", total)
+        return
+
+    await execute(
+        """
+        ALTER TABLE cultivators
+            ADD COLUMN last_updated DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                AFTER qi_threshold
+        """
+    )
+    log.debug("Migration 7/%d OK — last_updated column added", total)
+
+
+MIGRATIONS: list[str | object] = [
     # 1. Core cultivators table
     """
     CREATE TABLE IF NOT EXISTS cultivators (
@@ -128,28 +170,22 @@ MIGRATIONS: list[str] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 7. ALTER existing cultivators table for installs that ran migrations 1-6
-    #    before this patch.  Both statements are safe to re-run:
-    #      - ADD COLUMN IF NOT EXISTS is a no-op if the column already exists.
-    #      - MODIFY COLUMN is idempotent — it just resets the default.
-    #
-    #    last_tick_at is left untouched so no data is lost.
-    """
-    ALTER TABLE cultivators
-        ADD COLUMN IF NOT EXISTS last_updated DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            AFTER qi_threshold
-    """,
+    # 7. Add last_updated for installs that pre-date the column.
+    #    Uses a Python-level guard because MySQL does not support
+    #    ADD COLUMN IF NOT EXISTS (MariaDB-only syntax).
+    _migration_7,
 
+    # 8. Ensure affinity column has the correct definition.
+    #    MODIFY COLUMN is idempotent — safe to re-run.
     """
     ALTER TABLE cultivators
         MODIFY COLUMN affinity ENUM('fire','water','lightning','wood','earth')
             NULL DEFAULT NULL
     """,
 
-    # 8. Backfill last_updated for rows that were inserted before migration 7.
+    # 9. Backfill last_updated for rows inserted before migration 7.
     #    Sets last_updated = registered_at so accrual is calculated from when
     #    the cultivator actually joined, not from epoch / NULL.
-    #    Rows that already have a non-default last_updated are left alone.
     """
     UPDATE cultivators
     SET last_updated = registered_at
@@ -157,14 +193,14 @@ MIGRATIONS: list[str] = [
        OR last_updated IS NULL
     """,
 
-    # 9. Backfill affinity: rows that have the old DEFAULT 'water' but never
-    #    explicitly chose an affinity should be reset to NULL so the
-    #    /choose_affinity prompt appears for them.
+    # 10. Backfill affinity: rows that still carry the old DEFAULT 'water'
+    #     but never explicitly chose an affinity are reset to NULL so the
+    #     /choose_affinity prompt will appear for them.
     #
-    #    WARNING: if any real cultivator legitimately chose Water before this
-    #    migration, their affinity will be wiped here.  If that is a concern,
-    #    skip this statement or narrow the WHERE clause with a date guard, e.g.:
-    #      AND registered_at >= '<date you deployed the affinity system>'
+    #     WARNING: any cultivator who legitimately chose Water before this
+    #     migration runs will have their affinity wiped.  Narrow the WHERE
+    #     clause with a date guard if that is a concern, e.g.:
+    #       AND registered_at >= '<date you deployed the affinity system>'
     """
     UPDATE cultivators
     SET affinity = NULL
@@ -174,15 +210,25 @@ MIGRATIONS: list[str] = [
 
 
 async def run_migrations() -> None:
-    for i, query in enumerate(MIGRATIONS, start=1):
+    total = len(MIGRATIONS)
+    for i, migration in enumerate(MIGRATIONS, start=1):
         try:
-            await execute(query)
-            log.debug("Migration %d/%d OK", i, len(MIGRATIONS))
+            if callable(migration):
+                # Callable migrations handle their own logging / skipping
+                await migration(total)
+            else:
+                await execute(migration)
+                log.debug("Migration %d/%d OK", i, total)
         except Exception:
-            log.exception("Migration %d/%d FAILED — query:\n%s", i, len(MIGRATIONS), query.strip())
+            log.exception(
+                "Migration %d/%d FAILED — query:\n%s",
+                i,
+                total,
+                migration.strip() if isinstance(migration, str) else repr(migration),
+            )
             raise
 
-    log.info("Migrations  » %d statement(s) applied", len(MIGRATIONS))
+    log.info("Migrations  » %d statement(s) processed", total)
 
 
 async def _run_standalone() -> None:

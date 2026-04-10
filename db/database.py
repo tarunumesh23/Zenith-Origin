@@ -11,6 +11,10 @@ log = logging.getLogger("bot.database")
 pool: aiomysql.Pool | None = None
 
 
+# ---------------------------------------------------------------------------
+# Connection lifecycle
+# ---------------------------------------------------------------------------
+
 async def connect() -> None:
     global pool
 
@@ -19,21 +23,28 @@ async def connect() -> None:
         raise ValueError("DATABASE_URL environment variable is not set")
 
     url = urlparse(database_url)
+    db_name = url.path.lstrip("/")
+    host = url.hostname
+    port = url.port or 3306
+
+    if not host or not db_name:
+        raise ValueError("DATABASE_URL is malformed — missing host or database name")
 
     pool = await aiomysql.create_pool(
-        host=url.hostname,
-        port=url.port or 3306,
+        host=host,
+        port=port,
         user=url.username,
         password=url.password,
-        db=url.path.lstrip("/"),
+        db=db_name,
         autocommit=True,
-        minsize=1,
+        minsize=2,
         maxsize=10,
         charset="utf8mb4",
-        auth_plugin="mysql_native_password",  # ← fix for caching_sha2_password error
+        auth_plugin="mysql_native_password",
+        connect_timeout=10,
     )
 
-    log.info("Database    » Connected  (host=%s db=%s)", url.hostname, url.path.lstrip("/"))
+    log.info("Database    » Connected  (host=%s db=%s)", host, db_name)
 
 
 async def disconnect() -> None:
@@ -89,6 +100,8 @@ async def execute(query: str, args: tuple | list | None = None) -> int:
 
 async def execute_many(query: str, args: list[tuple | list]) -> None:
     """Execute a write query for each item in *args* (bulk insert / update)."""
+    if not args:
+        return
     async with _get_pool().acquire() as conn:
         async with conn.cursor() as cur:
             await cur.executemany(query, args)

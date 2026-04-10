@@ -12,7 +12,7 @@ from story.introstory import OUTCOMES, SCENES, STORY_BANNER_URL, SceneView, _bui
 from cultivation.constants import AFFINITIES, AFFINITY_DISPLAY
 from talent.engine import roll_starter_talent
 from talent.models import PlayerTalentData
-from db import talents as talent_db
+from db import talent as talent_db
 from ui.embed import build_embed
 
 log = logging.getLogger("bot.cogs.start")

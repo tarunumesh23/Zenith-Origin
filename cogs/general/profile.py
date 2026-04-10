@@ -12,7 +12,7 @@ from cultivation.constants import (
     get_reputation_title,
 )
 from db.cultivators import get_cultivator
-from db import talents as talent_db
+from db import talent as talent_db
 from talent.cultivation_bridge import describe_bonuses
 from talent.constants import RARITIES
 from ui.embed import build_embed, error_embed

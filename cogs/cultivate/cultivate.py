@@ -279,53 +279,6 @@ class Cultivate(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-    # ── /choose_affinity ──────────────────────────────────────────────────
-
-    @commands.hybrid_command(
-        name="choose_affinity",
-        description="Choose your elemental affinity (once only)",
-    )
-    @commands.cooldown(1, 5, commands.BucketType.user)
-    async def choose_affinity(self, ctx: commands.Context) -> None:
-        if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
-
-        row = await _guard_cultivator(ctx)
-        if row is None:
-            return
-
-        if row["affinity"] is not None:
-            await ctx.send(
-                embed=error_embed(
-                    ctx,
-                    title="Affinity Already Chosen",
-                    description=(
-                        f"Your path is already attuned to **{AFFINITY_DISPLAY[row['affinity']]}**. "
-                        "This cannot be changed."
-                    ),
-                ),
-                ephemeral=True,
-            )
-            return
-
-        view = _AffinitySelectView(ctx)
-        embed = build_embed(
-            ctx,
-            title="⚗️ Choose Your Elemental Affinity",
-            description=(
-                "Your affinity shapes every aspect of your cultivation.\n"
-                "It affects your Qi gain, breakthrough odds, and combat power.\n\n"
-                "**This choice is permanent.**\n\n"
-                "🔥 **Fire** — +15% Qi/sec. Breakthroughs are unstable but powerful.\n"
-                "💧 **Water** — Smooth progression. Breakthroughs are safer.\n"
-                "⚡ **Lightning** — Volatile. Hardest breakthroughs, but rare stage skips.\n"
-                "🌿 **Wood** — +10% Qi/sec. Steady and resilient.\n"
-                "🪨 **Earth** — Tanky. Slower Qi gain, best combat stability."
-            ),
-            color=discord.Color.blurple(),
-        )
-        await ctx.send(embed=embed, view=view, ephemeral=True)
-
     # ── /qi ───────────────────────────────────────────────────────────────
 
     @commands.hybrid_command(

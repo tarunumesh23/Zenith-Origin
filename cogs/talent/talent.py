@@ -24,7 +24,7 @@ from talent.engine import (
 )
 from talent.cultivation_bridge import describe_bonuses  # CHANGE 1
 from talent.models import PlayerTalent, PlayerTalentData
-from db import talents as db
+from db import talent as db
 from ui.embed import build_embed, error_embed
 
 log = logging.getLogger("bot.cogs.talent")

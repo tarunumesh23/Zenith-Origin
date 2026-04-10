@@ -27,15 +27,24 @@ class BreakthroughResult:
     realm_after:  str
     stage_after:  int
     message:      str             # flavour text for the embed
+    qi_loss_negated: bool = False # True → talent rebirth bonus triggered
 
 
 # ---------------------------------------------------------------------------
 # Core resolution
 # ---------------------------------------------------------------------------
 
-async def attempt_breakthrough(row: dict) -> BreakthroughResult:
+async def attempt_breakthrough(
+    row: dict,
+    talent_breakthrough_bonus: float = 0.0,   # additive % points from active talent tags
+    talent_overflow_chance:    float = 0.05,   # absolute probability (replaces default)
+    talent_negate_qi_loss:     float = 0.0,    # 0.0–1.0 chance to negate Qi loss on fail
+) -> BreakthroughResult:
     """
     Resolve a breakthrough attempt for the given (already-flushed) cultivator row.
+
+    Talent bonuses are injected by the caller (cultivate.py) via
+    ``talent/cultivation_bridge.get_cultivation_bonuses()``.
 
     Contract with the caller (cultivate.py):
     - ``row`` must have been produced by ``_flush_qi`` immediately before this
@@ -46,7 +55,7 @@ async def attempt_breakthrough(row: dict) -> BreakthroughResult:
 
     Side-effects applied here:
     - Stage advance (success path)
-    - Qi loss (fail path)
+    - Qi loss (fail path, unless negated by talent)
     - Tribulation exit (both paths)
     - Breakthrough audit log entry (both paths)
 
@@ -64,15 +73,17 @@ async def attempt_breakthrough(row: dict) -> BreakthroughResult:
     base_success   = BREAKTHROUGH_ODDS[realm]
     affinity_mod   = AFFINITY_BREAKTHROUGH_MODIFIER.get(affinity, 0.0)
     stabilise_mod  = 10.0 if not stabilised else 0.0
-    success_chance = min(base_success + affinity_mod + stabilise_mod, 97.0)
+    success_chance = min(
+        base_success + affinity_mod + stabilise_mod + talent_breakthrough_bonus,
+        97.0,
+    )
 
     roll = random.uniform(0, 100)
 
     # ── Success ────────────────────────────────────────────────────────────
     if roll < success_chance:
-        # Decide overflow *before* any writes so we either do both advances
-        # or neither — keeps DB state consistent if an exception occurs mid-way.
-        overflow = random.random() < 0.05
+        # Talent-influenced overflow chance replaces the hard-coded 0.05 default.
+        overflow = random.random() < talent_overflow_chance
 
         updated = await db.advance_stage(discord_id, row)
         if overflow:
@@ -98,16 +109,22 @@ async def attempt_breakthrough(row: dict) -> BreakthroughResult:
     # ── Failure ────────────────────────────────────────────────────────────
     loss_pct, cd_minutes = FAIL_CONSEQUENCES[realm]
 
-    # apply_qi_loss now accepts `now` so the stored timestamp matches the one
-    # we computed at the top of this function — no clock drift.
-    updated = await db.apply_qi_loss(discord_id, loss_pct, now=now)
-    qi_lost = row["qi"] - updated["qi"]   # actual loss, not an estimate
+    qi_loss_negated = (
+        talent_negate_qi_loss > 0
+        and random.random() < talent_negate_qi_loss
+    )
+
+    if qi_loss_negated:
+        # Talent absorbed the backlash — update timestamp only, no Qi removed.
+        updated = await db.set_qi(discord_id, row["qi"], now)
+        qi_lost = 0
+    else:
+        updated = await db.apply_qi_loss(discord_id, loss_pct, now=now)
+        qi_lost = row["qi"] - updated["qi"]
 
     await db.exit_tribulation(discord_id)
 
     cooldown_end = now + timedelta(minutes=cd_minutes)
-    # Cooldown is written by the *caller* (cultivate.py) so that all cooldown
-    # logic lives in one place and this function stays side-effect minimal.
 
     await db.log_breakthrough(
         discord_id, realm, stage, "fail", qi_lost=qi_lost
@@ -122,7 +139,8 @@ async def attempt_breakthrough(row: dict) -> BreakthroughResult:
         stage_before=stage,
         realm_after=realm,
         stage_after=stage,
-        message=_fail_message(realm, affinity),
+        message=_fail_message(realm, affinity, qi_loss_negated),
+        qi_loss_negated=qi_loss_negated,
     )
 
 
@@ -173,7 +191,13 @@ def _success_message(realm: str, overflow: bool) -> str:
     return f"✅ **Breakthrough!** {line}"
 
 
-def _fail_message(realm: str, affinity: str) -> str:
+def _fail_message(realm: str, affinity: str, negated: bool) -> str:
+    if negated:
+        return (
+            "❌ **Breakthrough Failed — but your talent held firm.** "
+            "The tribulation energy scattered against your innate power. "
+            "Your Qi was preserved. The Path endures."
+        )
     line = _FAIL_LINES.get(affinity, "The tribulation overwhelmed you.")
     return (
         f"❌ **Breakthrough Failed.** {line} "

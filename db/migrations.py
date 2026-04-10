@@ -11,20 +11,18 @@ log = logging.getLogger("bot.migrations")
 # Migration list
 # Each entry is either:
 #   - a plain SQL string  → executed directly
-#   - a callable          → async def(total: int) -> None, handles its own logic
+#   - a callable          → async def(total: int) -> None
 #
-# The callable form is used for migrations that need conditional logic
-# (e.g. "ADD COLUMN only if it doesn't already exist") because MySQL does
-# not support ADD COLUMN IF NOT EXISTS — that syntax is MariaDB-only.
+# Callables are used for migrations that need conditional logic because
+# MySQL does not support ADD COLUMN IF NOT EXISTS (MariaDB-only syntax).
 # ---------------------------------------------------------------------------
+
 
 async def _migration_7(total: int) -> None:
     """
-    Add last_updated column for installs that ran migrations 1-6
-    before this column was introduced.
-
-    MySQL does NOT support ADD COLUMN IF NOT EXISTS (that is MariaDB only).
-    We guard the ALTER at the Python level instead.
+    Add last_updated column for installs that ran migrations 1-6 before
+    this column was introduced.
+    FIX #9: pass an explicit empty tuple for args instead of None.
     """
     row = await fetch_one(
         """
@@ -33,7 +31,8 @@ async def _migration_7(total: int) -> None:
         WHERE TABLE_SCHEMA = DATABASE()
           AND TABLE_NAME   = 'cultivators'
           AND COLUMN_NAME  = 'last_updated'
-        """
+        """,
+        (),   # FIX #9: explicit empty args tuple
     )
     if row and row["cnt"]:
         log.debug("Migration 7/%d SKIP — last_updated already exists", total)
@@ -60,41 +59,32 @@ MIGRATIONS: list[str | object] = [
         registered_at   DATETIME            NOT NULL,
         outcome         ENUM('pass','retry','fail') NOT NULL,
 
-        -- Cultivation progression
         realm           ENUM('mortal','qi_gathering','qi_condensation','qi_refining')
                             NOT NULL DEFAULT 'mortal',
         stage           TINYINT UNSIGNED    NOT NULL DEFAULT 1,
         qi              INT UNSIGNED        NOT NULL DEFAULT 0,
         qi_threshold    INT UNSIGNED        NOT NULL DEFAULT 100,
 
-        -- Affinity (NULL = not yet chosen)
         affinity ENUM('fire','water','lightning','wood','earth')
             NULL DEFAULT NULL,
 
-        -- Real-time Qi accrual: qi is the stored value at last_updated;
-        -- current Qi is computed as min(qi + rate * elapsed, qi_threshold).
         last_updated    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-        -- Breakthrough state
         in_tribulation          BOOLEAN     NOT NULL DEFAULT FALSE,
         tribulation_started_at  DATETIME    DEFAULT NULL,
         breakthrough_cooldown   DATETIME    DEFAULT NULL,
 
-        -- Active buffs
         closed_cult_until       DATETIME    DEFAULT NULL,
         stabilise_used          BOOLEAN     NOT NULL DEFAULT FALSE,
 
-        -- PvP stats
         reputation      SMALLINT            NOT NULL DEFAULT 0,
         total_wins      SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
         total_losses    SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
         fled_challenges SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
 
-        -- PvP debuffs & defences
         ward_until              DATETIME    DEFAULT NULL,
         crippled_until          DATETIME    DEFAULT NULL,
 
-        -- Life-and-Death Duel permanent bonus
         foundation_bonus        SMALLINT UNSIGNED NOT NULL DEFAULT 0
 
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
@@ -142,7 +132,7 @@ MIGRATIONS: list[str | object] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 5. Pending Dao Challenges (survive bot restarts)
+    # 5. Pending Dao Challenges
     """
     CREATE TABLE IF NOT EXISTS pending_challenges (
         challenger_id   BIGINT UNSIGNED     NOT NULL,
@@ -171,12 +161,9 @@ MIGRATIONS: list[str | object] = [
     """,
 
     # 7. Add last_updated for installs that pre-date the column.
-    #    Uses a Python-level guard because MySQL does not support
-    #    ADD COLUMN IF NOT EXISTS (MariaDB-only syntax).
     _migration_7,
 
-    # 8. Ensure affinity column has the correct definition.
-    #    MODIFY COLUMN is idempotent — safe to re-run.
+    # 8. Ensure affinity column has the correct definition (idempotent).
     """
     ALTER TABLE cultivators
         MODIFY COLUMN affinity ENUM('fire','water','lightning','wood','earth')
@@ -184,8 +171,6 @@ MIGRATIONS: list[str | object] = [
     """,
 
     # 9. Backfill last_updated for rows inserted before migration 7.
-    #    Sets last_updated = registered_at so accrual is calculated from when
-    #    the cultivator actually joined, not from epoch / NULL.
     """
     UPDATE cultivators
     SET last_updated = registered_at
@@ -193,18 +178,159 @@ MIGRATIONS: list[str | object] = [
        OR last_updated IS NULL
     """,
 
-    # 10. Backfill affinity: rows that still carry the old DEFAULT 'water'
-    #     but never explicitly chose an affinity are reset to NULL so the
-    #     /choose_affinity prompt will appear for them.
+    # 10. FIX #10: removed the unconditional Water→NULL wipe that would
+    #     destroy legitimate Water affinity choices.  If you still need to
+    #     reset the old hardcoded default, add a date guard here, e.g.:
     #
-    #     WARNING: any cultivator who legitimately chose Water before this
-    #     migration runs will have their affinity wiped.  Narrow the WHERE
-    #     clause with a date guard if that is a concern, e.g.:
-    #       AND registered_at >= '<date you deployed the affinity system>'
+    #   UPDATE cultivators SET affinity = NULL
+    #   WHERE affinity = 'water'
+    #     AND registered_at < '<date you deployed affinity choice>'
+    #
+    # This migration is intentionally a no-op so the numbering stays stable.
+    "SELECT 1  /* migration 10 — intentional no-op, see comment above */",
+
+    # =========================================================================
+    #  TALENT SYSTEM TABLES  (migrations 11–18)
+    # =========================================================================
+
+    # 11. Active talent per player (one row per player)
     """
-    UPDATE cultivators
-    SET affinity = NULL
-    WHERE affinity = 'water'
+    CREATE TABLE IF NOT EXISTS player_talents (
+        discord_id        BIGINT UNSIGNED     NOT NULL PRIMARY KEY,
+        guild_id          BIGINT UNSIGNED     NOT NULL,
+
+        talent_name       VARCHAR(100)        NOT NULL,
+        talent_rarity     ENUM(
+                            'Trash','Common','Rare','Elite',
+                            'Heavenly','Mythical','Divine'
+                          )                   NOT NULL,
+        talent_multiplier FLOAT               NOT NULL DEFAULT 1.0,
+        evolution_stage   TINYINT UNSIGNED    NOT NULL DEFAULT 0,
+        is_corrupted      BOOLEAN             NOT NULL DEFAULT FALSE,
+        is_locked         BOOLEAN             NOT NULL DEFAULT FALSE,
+
+        tags              TEXT                NOT NULL DEFAULT ('[]'),
+
+        acquired_at       DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_updated      DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 12. Talent inventory (multiple talents per player)
+    """
+    CREATE TABLE IF NOT EXISTS talent_inventory (
+        id                BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        discord_id        BIGINT UNSIGNED     NOT NULL,
+        guild_id          BIGINT UNSIGNED     NOT NULL,
+
+        talent_name       VARCHAR(100)        NOT NULL,
+        talent_rarity     ENUM(
+                            'Trash','Common','Rare','Elite',
+                            'Heavenly','Mythical','Divine'
+                          )                   NOT NULL,
+        talent_multiplier FLOAT               NOT NULL DEFAULT 1.0,
+        evolution_stage   TINYINT UNSIGNED    NOT NULL DEFAULT 0,
+        is_corrupted      BOOLEAN             NOT NULL DEFAULT FALSE,
+        is_locked         BOOLEAN             NOT NULL DEFAULT FALSE,
+
+        tags              TEXT                NOT NULL DEFAULT ('[]'),
+
+        acquired_at       DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 13. Spin pity counters — FIX #11: added guild_id for per-server pity
+    """
+    CREATE TABLE IF NOT EXISTS talent_spin_pity (
+        discord_id        BIGINT UNSIGNED     NOT NULL,
+        guild_id          BIGINT UNSIGNED     NOT NULL DEFAULT 0,
+        pity_elite        SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+        pity_heavenly     SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+        pity_mythical     SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+        total_spins       INT UNSIGNED        NOT NULL DEFAULT 0,
+
+        PRIMARY KEY (discord_id, guild_id),
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 14. Fusion pity counters — FIX #11: added guild_id for per-server pity
+    """
+    CREATE TABLE IF NOT EXISTS talent_fusion_pity (
+        discord_id        BIGINT UNSIGNED     NOT NULL,
+        guild_id          BIGINT UNSIGNED     NOT NULL DEFAULT 0,
+        fusion_pity       SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+        total_fusions     INT UNSIGNED        NOT NULL DEFAULT 0,
+
+        PRIMARY KEY (discord_id, guild_id),
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 15. Immutable spin audit log
+    """
+    CREATE TABLE IF NOT EXISTS talent_spin_log (
+        id                BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        discord_id        BIGINT UNSIGNED     NOT NULL,
+        guild_id          BIGINT UNSIGNED     NOT NULL,
+        talent_name       VARCHAR(100)        NOT NULL,
+        talent_rarity     ENUM(
+                            'Trash','Common','Rare','Elite',
+                            'Heavenly','Mythical','Divine'
+                          )                   NOT NULL,
+        pity_triggered    BOOLEAN             NOT NULL DEFAULT FALSE,
+        accepted          BOOLEAN             NOT NULL DEFAULT FALSE,
+        spun_at           DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 16. Immutable fusion audit log — FIX #12: added 'auto' to mode ENUM
+    """
+    CREATE TABLE IF NOT EXISTS talent_fusion_log (
+        id                BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        discord_id        BIGINT UNSIGNED     NOT NULL,
+        guild_id          BIGINT UNSIGNED     NOT NULL,
+        talent_a          VARCHAR(100)        NOT NULL,
+        talent_b          VARCHAR(100)        NOT NULL,
+        mode              ENUM('auto','same','cross','rng') NOT NULL,
+        success           BOOLEAN             NOT NULL,
+        result_name       VARCHAR(100)        DEFAULT NULL,
+        failure_outcome   ENUM('backfire','corruption','mutation','catastrophic') DEFAULT NULL,
+        fused_at          DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 17. One-per-server claimed legendary talents
+    """
+    CREATE TABLE IF NOT EXISTS server_claimed_talents (
+        guild_id          BIGINT UNSIGNED     NOT NULL,
+        discord_id        BIGINT UNSIGNED     NOT NULL,
+        talent_name       VARCHAR(100)        NOT NULL,
+        claimed_at        DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+        PRIMARY KEY (guild_id, talent_name),
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+
+    # 18. FIX #13: spin tokens table (was entirely missing from schema)
+    """
+    CREATE TABLE IF NOT EXISTS spin_tokens (
+        discord_id        BIGINT UNSIGNED     NOT NULL,
+        guild_id          BIGINT UNSIGNED     NOT NULL,
+        tokens            SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+
+        PRIMARY KEY (discord_id, guild_id),
+        FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 ]
 
@@ -214,7 +340,6 @@ async def run_migrations() -> None:
     for i, migration in enumerate(MIGRATIONS, start=1):
         try:
             if callable(migration):
-                # Callable migrations handle their own logging / skipping
                 await migration(total)
             else:
                 await execute(migration)

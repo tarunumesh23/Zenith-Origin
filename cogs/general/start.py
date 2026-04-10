@@ -10,6 +10,9 @@ from discord.ext import commands
 from db.cultivators import has_passed, set_affinity, upsert_cultivator
 from story.introstory import OUTCOMES, SCENES, STORY_BANNER_URL, SceneView, _build_scene_embed
 from cultivation.constants import AFFINITIES, AFFINITY_DISPLAY
+from talent.engine import roll_starter_talent
+from talent.models import PlayerTalentData
+from db import talents as talent_db
 from ui.embed import build_embed
 
 log = logging.getLogger("bot.cogs.start")
@@ -71,7 +74,7 @@ class Start(commands.Cog):
     ) -> None:
         scene = SCENES[scene_index]
         embed = _build_scene_embed(ctx, scene_index, scene["description"])
-        view = SceneView(self, ctx, scene_index, score)
+        view  = SceneView(self, ctx, scene_index, score)
         await ctx.send(embed=embed, view=view)
 
     async def send_outcome(
@@ -89,9 +92,7 @@ class Start(commands.Cog):
         else:
             key = "fail"
 
-        outcome = OUTCOMES[key]
-
-        # Roll affinity once — same value shown in embed and written to DB
+        outcome  = OUTCOMES[key]
         affinity: str | None = random.choice(AFFINITIES) if key == "pass" else None
 
         affinity_line = (
@@ -99,10 +100,38 @@ class Start(commands.Cog):
             if affinity else ""
         )
 
+        # ── Roll starter talent on pass ───────────────────────────────
+        starter_talent = None
+        talent_line    = ""
+        guild_id       = ctx.guild.id if ctx.guild else 0
+
+        if key == "pass":
+            try:
+                claimed        = await talent_db.get_claimed_one_per_server(guild_id)
+                starter_talent = roll_starter_talent(claimed)
+
+                from talent.constants import RARITIES
+                rarity_data = RARITIES.get(starter_talent.rarity, {})
+                talent_line = (
+                    f"\n\n**Talent Awakened:** "
+                    f"{rarity_data.get('emoji', '')} **{starter_talent.name}** "
+                    f"[{starter_talent.rarity}]"
+                    f"\n*{starter_talent.description}*"
+                )
+            except Exception:
+                log.exception(
+                    "Story » Failed to roll starter talent for discord_id=%s", ctx.author.id
+                )
+
         embed = build_embed(
             ctx,
             title=outcome["title"],
-            description=f"{outcome['description']}{affinity_line}\n\n**Final Score:** `{score}/10`",
+            description=(
+                f"{outcome['description']}"
+                f"{affinity_line}"
+                f"{talent_line}"
+                f"\n\n**Final Score:** `{score}/10`"
+            ),
             color=outcome["color"],
             show_footer=True,
         )
@@ -113,10 +142,9 @@ class Start(commands.Cog):
         if STORY_BANNER_URL:
             embed.set_image(url=STORY_BANNER_URL)
 
-        # Edit the scene message in place
         await interaction.response.edit_message(embed=embed, view=None)
 
-        # Persist to DB
+        # ── Persist to DB ─────────────────────────────────────────────
         try:
             await upsert_cultivator(
                 discord_id=ctx.author.id,
@@ -130,12 +158,54 @@ class Start(commands.Cog):
         except Exception:
             log.exception("Story » Failed to upsert cultivator %s", ctx.author.id)
 
-        log.info("Story » %s finished trial — outcome=%s score=%d affinity=%s", ctx.author, key, score, affinity)
+        # ── Save starter talent ───────────────────────────────────────
+        if key == "pass" and starter_talent is not None:
+            try:
+                player = PlayerTalentData(user_id=ctx.author.id, guild_id=guild_id)
+                player.active_talent = starter_talent
+                await talent_db.save_player_talent_data(player)
+
+                # Log the starter roll (no pity, auto-accepted)
+                await talent_db.log_spin(
+                    ctx.author.id,
+                    guild_id,
+                    starter_talent.name,
+                    starter_talent.rarity,
+                    pity_triggered=False,
+                    accepted=True,
+                )
+
+                # Claim one-per-server talent if applicable
+                from talent.constants import ONE_PER_SERVER_TALENTS
+                if starter_talent.name in ONE_PER_SERVER_TALENTS:
+                    await talent_db.claim_one_per_server(
+                        guild_id, ctx.author.id, starter_talent.name
+                    )
+
+                log.info(
+                    "Story » starter talent assigned discord_id=%s talent=%s rarity=%s",
+                    ctx.author.id, starter_talent.name, starter_talent.rarity,
+                )
+            except Exception:
+                log.exception(
+                    "Story » Failed to save starter talent for discord_id=%s", ctx.author.id
+                )
+
+        log.info(
+            "Story » %s finished trial — outcome=%s score=%d affinity=%s talent=%s",
+            ctx.author, key, score, affinity,
+            starter_talent.name if starter_talent else "none",
+        )
 
         if key == "pass":
-            await self._log_cultivator(ctx, affinity)
+            await self._log_cultivator(ctx, affinity, starter_talent)
 
-    async def _log_cultivator(self, ctx: commands.Context, affinity: str | None = None) -> None:
+    async def _log_cultivator(
+        self,
+        ctx: commands.Context,
+        affinity: str | None = None,
+        starter_talent=None,
+    ) -> None:
         channel = self.bot.get_channel(CULTIVATION_LOG_CHANNEL)
         if channel is None:
             log.warning("Story » CULTIVATION_LOG_CHANNEL %d not found", CULTIVATION_LOG_CHANNEL)
@@ -146,12 +216,23 @@ class Start(commands.Cog):
             if affinity else ""
         )
 
+        talent_line = ""
+        if starter_talent is not None:
+            from talent.constants import RARITIES
+            rarity_data = RARITIES.get(starter_talent.rarity, {})
+            talent_line = (
+                f"\nTalent: {rarity_data.get('emoji', '')} {starter_talent.name} "
+                f"[{starter_talent.rarity}]"
+            )
+
         embed = build_embed(
             ctx,
             title="⚡ A New Cultivator Has Emerged",
             description=(
                 f"{ctx.author.mention} has proven themselves worthy.\n"
-                f"The Dao has opened its gates.{affinity_line}"
+                f"The Dao has opened its gates."
+                f"{affinity_line}"
+                f"{talent_line}"
             ),
             color=discord.Color.gold(),
             thumbnail=ctx.author.display_avatar.url,

@@ -12,6 +12,9 @@ from cultivation.constants import (
     get_reputation_title,
 )
 from db.cultivators import get_cultivator
+from db import talents as talent_db
+from talent.cultivation_bridge import describe_bonuses
+from talent.constants import RARITIES
 from ui.embed import build_embed, error_embed
 
 log = logging.getLogger("bot.cogs.profile")
@@ -54,10 +57,23 @@ def _qi_bar(qi: int, threshold: int, length: int = 10) -> str:
     return "█" * filled + "░" * (length - filled)
 
 
+def _enrich_talent(talent) -> tuple[str, str]:
+    """Return (display_line, bonus_line) for the active talent, or two empty strings."""
+    if talent is None:
+        return "*None*", ""
+    rarity_data = RARITIES.get(talent.rarity, {})
+    emoji       = rarity_data.get("emoji", "")
+    stage_label = ["", " ✦", " ✦✦"][talent.evolution_stage]
+    display     = f"{emoji} **{talent.name}**{stage_label} [{talent.rarity}] ×{talent.multiplier:.2f}"
+    bonuses     = describe_bonuses(talent)
+    return display, bonuses
+
+
 def _build_profile_embed(
     ctx: commands.Context,
     target: discord.Member,
     row: dict,
+    active_talent=None,
 ) -> discord.Embed:
     age      = _cultivation_age(row["registered_at"])
     realm    = REALM_DISPLAY.get(row["realm"], row["realm"])
@@ -81,6 +97,11 @@ def _build_profile_embed(
         from datetime import datetime as dt
         if until > dt.now(tz.utc):
             closed_note = f"\n🔒 *In closed cultivation until <t:{int(until.timestamp())}:t>*"
+
+    talent_display, talent_bonuses = _enrich_talent(active_talent)
+    talent_value = talent_display
+    if talent_bonuses:
+        talent_value += f"\n{talent_bonuses}"
 
     embed = build_embed(
         ctx,
@@ -125,6 +146,11 @@ def _build_profile_embed(
                 "name": "🕰️ Cultivation Age",
                 "value": age,
                 "inline": True,
+            },
+            {
+                "name": "🌟 Active Talent",
+                "value": talent_value,
+                "inline": False,
             },
         ],
         thumbnail=target.display_avatar.url,
@@ -181,7 +207,19 @@ class Profile(commands.Cog):
             )
             return
 
-        embed = _build_profile_embed(ctx, target, row)
+        # Load active talent (guild-scoped; fall back gracefully on error)
+        guild_id     = ctx.guild.id if ctx.guild else 0
+        active_talent = None
+        try:
+            player_data = await talent_db.get_player_talent_data(target.id, guild_id)
+            if player_data:
+                active_talent = player_data.active_talent
+        except Exception:
+            log.warning(
+                "Profile » could not load talent for discord_id=%s — skipping", target.id
+            )
+
+        embed = _build_profile_embed(ctx, target, row, active_talent)
         log.debug("Profile » %s viewed profile of %s", ctx.author, target)
         await ctx.send(embed=embed)
 

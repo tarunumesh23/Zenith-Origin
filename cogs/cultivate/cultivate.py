@@ -16,6 +16,9 @@ from cultivation.constants import (
     compute_current_qi,
 )
 from db import cultivators as db
+from db import talents as talent_db
+from talent.cultivation_bridge import get_cultivation_bonuses, describe_bonuses
+from talent.models import PlayerTalent, PlayerTalentData
 from ui.embed import build_embed, error_embed
 
 log = logging.getLogger("bot.cogs.cultivate")
@@ -82,24 +85,46 @@ async def _guard_cultivator(ctx: commands.Context) -> dict | None:
     return row
 
 
-async def _flush_qi(row: dict, now: datetime | None = None) -> dict:
+async def _load_talent_bonuses(
+    discord_id: int,
+    guild_id: int,
+) -> tuple[dict[str, float], PlayerTalent | None]:
+    """
+    Load the player's active talent and return (bonuses dict, active_talent).
+    Falls back to identity bonuses (no effect) and None talent on any error.
+    """
+    try:
+        player_data: PlayerTalentData | None = await talent_db.get_player_talent_data(
+            discord_id, guild_id
+        )
+        active = player_data.active_talent if player_data else None
+    except Exception:
+        log.warning(
+            "Cultivate » could not load talent data for discord_id=%s — bonuses skipped",
+            discord_id,
+        )
+        active = None
+    return get_cultivation_bonuses(active), active
+
+
+async def _flush_qi(row: dict, bonuses: dict[str, float], now: datetime | None = None) -> dict:
     """
     Compute accrued Qi since ``row["last_updated"]``, persist it, and return
     the updated row.  Enters tribulation automatically if the threshold is met.
-
-    ``now`` should be passed in by the caller whenever it was already computed
-    in the same logical operation — keeps timestamps consistent across the
-    flush and any subsequent writes (e.g. cooldowns, closed-cult expiry).
     """
     if now is None:
         now = _now()
 
+    base_threshold     = row["qi_threshold"]
+    expanded_threshold = int(base_threshold * (1.0 + bonuses["qi_threshold_bonus"]))
+
     current_qi, _ = compute_current_qi(
         qi_stored=row["qi"],
-        qi_threshold=row["qi_threshold"],
+        qi_threshold=expanded_threshold,
         last_updated=row.get("last_updated"),
         affinity=row.get("affinity"),
         closed_cult_until=row.get("closed_cult_until"),
+        talent_multiplier=bonuses["qi_multiplier"],
         now=now,
     )
 
@@ -112,20 +137,19 @@ async def _flush_qi(row: dict, now: datetime | None = None) -> dict:
     return updated
 
 
-async def _break_closed_cultivation(ctx: commands.Context, row: dict) -> bool:
+async def _break_closed_cultivation(
+    ctx: commands.Context, row: dict, bonuses: dict[str, float]
+) -> bool:
     """
-    If the user is in active closed cultivation, cancel it (flushing Qi first
-    so progress is not lost) and notify them.
-
-    Returns True if closed cultivation was active and has been cancelled so
-    the caller can return early.
+    If the user is in active closed cultivation, cancel it (flushing Qi first)
+    and notify them.  Returns True if closed cultivation was active.
     """
     closed_until = row.get("closed_cult_until")
     if not (closed_until and _as_utc(closed_until) > _now()):
         return False
 
     now = _now()
-    await _flush_qi(row, now)
+    await _flush_qi(row, bonuses, now)
     await db.clear_closed_cultivation(ctx.author.id, now=now)
 
     await ctx.send(
@@ -148,26 +172,35 @@ async def _break_closed_cultivation(ctx: commands.Context, row: dict) -> bool:
 # /qi embed builder
 # ---------------------------------------------------------------------------
 
-def _build_qi_embed(ctx_or_interaction, row: dict, now: datetime) -> discord.Embed:
+def _build_qi_embed(
+    ctx_or_interaction,
+    row: dict,
+    now: datetime,
+    bonuses: dict[str, float],
+    active_talent: PlayerTalent | None = None,
+) -> discord.Embed:
+    base_threshold     = row["qi_threshold"]
+    expanded_threshold = int(base_threshold * (1.0 + bonuses["qi_threshold_bonus"]))
+
     current_qi, rate = compute_current_qi(
         qi_stored=row["qi"],
-        qi_threshold=row["qi_threshold"],
+        qi_threshold=expanded_threshold,
         last_updated=row.get("last_updated"),
         affinity=row.get("affinity"),
         closed_cult_until=row.get("closed_cult_until"),
+        talent_multiplier=bonuses["qi_multiplier"],
         now=now,
     )
     current_qi   = int(current_qi)
-    threshold    = row["qi_threshold"]
     affinity     = row.get("affinity")
     in_trib      = row.get("in_tribulation", False)
     closed_until = row.get("closed_cult_until")
 
-    pct    = min(current_qi / threshold, 1.0) if threshold else 0.0
+    pct    = min(current_qi / base_threshold, 1.0) if base_threshold else 0.0
     filled = int(pct * 20)
     bar    = "█" * filled + "░" * (20 - filled)
 
-    qi_remaining = max(0, threshold - current_qi)
+    qi_remaining = max(0, base_threshold - current_qi)
     if in_trib:
         ttf_str = "⚡ **Tribulation ready — use `/breakthrough`!**"
     elif qi_remaining == 0:
@@ -189,15 +222,36 @@ def _build_qi_embed(ctx_or_interaction, row: dict, now: datetime) -> discord.Emb
     affinity_label = AFFINITY_DISPLAY.get(affinity, affinity.title()) if affinity else "Not chosen"
     realm_label    = REALM_DISPLAY.get(row["realm"], row["realm"])
 
+    # Talent line — always shown; bonus details appended only when active
+    if active_talent is None:
+        talent_line = "\n**Talent:** *None*"
+    else:
+        from talent.constants import RARITIES
+        rarity_data  = RARITIES.get(active_talent.rarity, {})
+        t_emoji      = rarity_data.get("emoji", "")
+        stage_label  = ["", " ✦", " ✦✦"][active_talent.evolution_stage]
+        talent_line  = (
+            f"\n**Talent:** {t_emoji} {active_talent.name}{stage_label} "
+            f"[{active_talent.rarity}] ×{active_talent.multiplier:.2f}"
+        )
+        bonus_parts = []
+        if bonuses["qi_multiplier"] > 1.0:
+            bonus_parts.append(f"Qi ×{bonuses['qi_multiplier']:.2f}")
+        if bonuses["qi_threshold_bonus"] > 0:
+            bonus_parts.append(f"Threshold +{bonuses['qi_threshold_bonus']*100:.0f}%")
+        if bonus_parts:
+            talent_line += f" ({', '.join(bonus_parts)})"
+
     desc = (
         f"**Realm:** {realm_label} — Stage {row['stage']}\n"
         f"**Affinity:** {affinity_label}\n\n"
         f"`{bar}` **{pct * 100:.1f}%**\n"
-        f"**Qi:** `{current_qi:,} / {threshold:,}`\n"
+        f"**Qi:** `{current_qi:,} / {base_threshold:,}`\n"
         f"**Qi/sec:** `{rate:.3f}`\n"
         f"**Time to fill:** {ttf_str}\n\n"
         f"**Closed Cultivation:** {cc_str}\n"
-        f"**Tribulation:** {'⚡ Pending — use `/breakthrough`!' if in_trib else 'Not yet'}\n\n"
+        f"**Tribulation:** {'⚡ Pending — use `/breakthrough`!' if in_trib else 'Not yet'}"
+        f"{talent_line}\n\n"
         f"-# Updates every {QI_LIVE_UPDATE_INTERVAL}s"
     )
 
@@ -287,8 +341,11 @@ class Cultivate(commands.Cog):
         if row is None:
             return
 
+        guild_id              = ctx.guild.id if ctx.guild else 0
+        bonuses, active_talent = await _load_talent_bonuses(ctx.author.id, guild_id)
+
         now     = _now()
-        message = await ctx.send(embed=_build_qi_embed(ctx, row, now))
+        message = await ctx.send(embed=_build_qi_embed(ctx, row, now, bonuses, active_talent))
 
         for _ in range(12):  # live-update for 60 s (12 × 5 s ticks)
             await asyncio.sleep(QI_LIVE_UPDATE_INTERVAL)
@@ -300,13 +357,17 @@ class Cultivate(commands.Cog):
             if row is None:
                 break
 
-            now        = _now()
+            now                = _now()
+            expanded_threshold = int(
+                row["qi_threshold"] * (1.0 + bonuses["qi_threshold_bonus"])
+            )
             current_qi, _ = compute_current_qi(
                 qi_stored=row["qi"],
-                qi_threshold=row["qi_threshold"],
+                qi_threshold=expanded_threshold,
                 last_updated=row.get("last_updated"),
                 affinity=row.get("affinity"),
                 closed_cult_until=row.get("closed_cult_until"),
+                talent_multiplier=bonuses["qi_multiplier"],
                 now=now,
             )
 
@@ -324,7 +385,7 @@ class Cultivate(commands.Cog):
                         pass
 
             try:
-                await message.edit(embed=_build_qi_embed(ctx, row, now))
+                await message.edit(embed=_build_qi_embed(ctx, row, now, bonuses, active_talent))
             except (discord.NotFound, discord.HTTPException):
                 break
 
@@ -353,7 +414,10 @@ class Cultivate(commands.Cog):
             )
             return
 
-        if await _break_closed_cultivation(ctx, row):
+        guild_id              = ctx.guild.id if ctx.guild else 0
+        bonuses, active_talent = await _load_talent_bonuses(ctx.author.id, guild_id)
+
+        if await _break_closed_cultivation(ctx, row, bonuses):
             return
 
         expires = await _check_cooldown(ctx.author.id, "meditate")
@@ -377,23 +441,26 @@ class Cultivate(commands.Cog):
             )
             return
 
-        # Single `now` shared across flush, bonus add, and cooldown stamp.
         now     = _now()
-        updated = await _flush_qi(row, now)
+        updated = await _flush_qi(row, bonuses, now)
 
         _, rate = compute_current_qi(
             qi_stored=updated["qi"],
-            qi_threshold=updated["qi_threshold"],
-            last_updated=now,   # just flushed — elapsed = 0, so only rate matters
+            qi_threshold=int(updated["qi_threshold"] * (1.0 + bonuses["qi_threshold_bonus"])),
+            last_updated=now,
             affinity=updated.get("affinity"),
             closed_cult_until=updated.get("closed_cult_until"),
+            talent_multiplier=bonuses["qi_multiplier"],
             now=now,
         )
         qi_gain = max(1, int(rate * 90))  # ~1.5× a 60-second window
 
-        # Pass `now` so add_qi stamps the same timestamp, not a new one.
         updated = await db.add_qi(ctx.author.id, qi_gain, now=now)
-        await db.set_cooldown(ctx.author.id, "meditate", now + timedelta(hours=1))
+
+        cooldown_seconds = int(3600 * bonuses["meditate_cooldown_mult"])
+        await db.set_cooldown(
+            ctx.author.id, "meditate", now + timedelta(seconds=cooldown_seconds)
+        )
 
         entered_tribulation = (
             updated["qi"] >= updated["qi_threshold"]
@@ -402,10 +469,17 @@ class Cultivate(commands.Cog):
         if entered_tribulation:
             await db.enter_tribulation(ctx.author.id, now=now)
 
+        if bonuses["meditate_cooldown_mult"] < 1.0:
+            cd_mins = cooldown_seconds // 60
+            cd_note = f"\n🧘 *Talent bonus: cooldown reduced to **{cd_mins}m**.*"
+        else:
+            cd_note = ""
+
         desc = (
             f"You sink into stillness. The world fades.\n\n"
             f"**+{qi_gain} Qi** absorbed.\n"
             f"Current Qi: `{updated['qi']:,} / {updated['qi_threshold']:,}`"
+            f"{cd_note}"
         )
         if entered_tribulation:
             desc += (
@@ -479,11 +553,13 @@ class Cultivate(commands.Cog):
             )
             return
 
+        guild_id              = ctx.guild.id if ctx.guild else 0
+        bonuses, active_talent = await _load_talent_bonuses(ctx.author.id, guild_id)
+
         now   = _now()
         until = now + timedelta(hours=4)
 
-        # Flush at the non-boosted rate before the 2× window starts.
-        await _flush_qi(row, now)
+        await _flush_qi(row, bonuses, now)
         await db.set_closed_cultivation(ctx.author.id, until)
         await db.set_cooldown(ctx.author.id, "closed_cultivation", until)
 
@@ -518,7 +594,10 @@ class Cultivate(commands.Cog):
         if row is None:
             return
 
-        if await _break_closed_cultivation(ctx, row):
+        guild_id              = ctx.guild.id if ctx.guild else 0
+        bonuses, active_talent = await _load_talent_bonuses(ctx.author.id, guild_id)
+
+        if await _break_closed_cultivation(ctx, row, bonuses):
             return
 
         if row["stabilise_used"]:
@@ -590,14 +669,16 @@ class Cultivate(commands.Cog):
             )
             return
 
-        if await _break_closed_cultivation(ctx, row):
+        guild_id              = ctx.guild.id if ctx.guild else 0
+        bonuses, active_talent = await _load_talent_bonuses(ctx.author.id, guild_id)
+
+        if await _break_closed_cultivation(ctx, row, bonuses):
             return
 
-        # Flush so in_tribulation and qi reflect live state.
-        row = await _flush_qi(row)
+        row = await _flush_qi(row, bonuses)
 
         if not row["in_tribulation"]:
-            current_qi = row["qi"]   # already flushed — this is the live value
+            current_qi = row["qi"]
             qi_needed  = max(0, row["qi_threshold"] - current_qi)
             await ctx.send(
                 embed=error_embed(
@@ -624,10 +705,13 @@ class Cultivate(commands.Cog):
             )
             return
 
-        result = await attempt_breakthrough(row)
+        result = await attempt_breakthrough(
+            row,
+            talent_breakthrough_bonus=bonuses["breakthrough_bonus"],
+            talent_overflow_chance=bonuses["overflow_chance"],
+            talent_negate_qi_loss=bonuses["negate_qi_loss_chance"],
+        )
 
-        # Cooldown lives here, not inside attempt_breakthrough, so all cooldown
-        # logic has exactly one home.
         if result.cooldown_end:
             await db.set_cooldown(ctx.author.id, "breakthrough", result.cooldown_end)
 
@@ -651,9 +735,13 @@ class Cultivate(commands.Cog):
             },
         ]
         if result.qi_lost:
-            fields.append({"name": "Qi Lost",      "value": f"`{result.qi_lost:,}`", "inline": True})
+            fields.append({"name": "Qi Lost",       "value": f"`{result.qi_lost:,}`", "inline": True})
+        if result.qi_loss_negated:
+            fields.append({"name": "Talent Shield", "value": "Qi loss negated 🛡️",   "inline": True})
         if result.cooldown_end:
-            fields.append({"name": "Next Attempt", "value": f"<t:{int(result.cooldown_end.timestamp())}:R>", "inline": True})
+            fields.append({"name": "Next Attempt",  "value": f"<t:{int(result.cooldown_end.timestamp())}:R>", "inline": True})
+        if bonuses["breakthrough_bonus"] > 0:
+            fields.append({"name": "Talent Bonus",  "value": f"+{bonuses['breakthrough_bonus']:.1f}% success", "inline": True})
 
         await ctx.send(
             embed=build_embed(
@@ -691,11 +779,8 @@ class _AffinitySelectView(discord.ui.View):
         return interaction.user.id == self.ctx.author.id
 
     async def on_timeout(self) -> None:
-        # Disable all buttons when the view expires so they don't look interactive.
         for item in self.children:
             item.disabled = True  # type: ignore[union-attr]
-        # The original message is not stored here; Discord will simply stop
-        # accepting interactions — acceptable UX for a 60-second window.
 
 
 class _AffinityButton(discord.ui.Button):
@@ -708,8 +793,6 @@ class _AffinityButton(discord.ui.Button):
         self.affinity = affinity
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        # Stop the view immediately so concurrent clicks from the same user
-        # cannot race through while the DB write is in-flight.
         self.view.stop()  # type: ignore[union-attr]
 
         await db.set_affinity(interaction.user.id, self.affinity)

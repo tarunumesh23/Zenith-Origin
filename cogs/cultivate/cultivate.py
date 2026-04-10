@@ -16,7 +16,7 @@ from cultivation.constants import (
     compute_current_qi,
 )
 from db import cultivators as db
-from db import talents as talent_db
+from db import talent as talent_db
 from talent.cultivation_bridge import get_cultivation_bonuses, describe_bonuses
 from talent.models import PlayerTalent, PlayerTalentData
 from ui.embed import build_embed, error_embed

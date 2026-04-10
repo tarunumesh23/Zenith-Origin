@@ -35,6 +35,7 @@ from db.pvp import (
     get_challenge,
     get_duel_request,
     get_incoming_challenge,
+    get_incoming_duel_request,
     has_active_ward,
     is_crippled,
     log_combat,
@@ -226,11 +227,17 @@ class PvP(commands.Cog):
             await ctx.send(embed=error_embed(ctx, "You have no pending challenges to accept."), ephemeral=True)
             return
 
-        challenger_id     = pending["challenger_id"]
-        challenger_member = ctx.guild.get_member(challenger_id)
-        if challenger_member is None:
+        challenger_id = pending["challenger_id"]
+
+        try:
+            challenger_member = await ctx.guild.fetch_member(challenger_id)
+        except discord.NotFound:
             await delete_challenge(challenger_id, ctx.author.id)
-            await ctx.send(embed=error_embed(ctx, "The challenger is no longer in this server."), ephemeral=True)
+            await ctx.send(embed=error_embed(ctx, "The challenger has left the server."), ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            log.warning("accept » fetch_member failed for %s: %s", challenger_id, e)
+            await ctx.send(embed=error_embed(ctx, "Could not resolve the challenger. Try again."), ephemeral=True)
             return
 
         c_row = await get_cultivator(challenger_id)
@@ -423,26 +430,26 @@ class PvP(commands.Cog):
 
     @commands.hybrid_command(name="acceptduel", description="Accept a pending Life-and-Death Duel")
     async def acceptduel(self, ctx: commands.Context) -> None:
-        from db.database import fetch_one
-
-        pending = await fetch_one(
-            """
-            SELECT * FROM pending_duels
-            WHERE target_id = %s AND expires_at > %s AND accepted = FALSE
-            ORDER BY requested_at DESC LIMIT 1
-            """,
-            (ctx.author.id, datetime.now(timezone.utc).replace(tzinfo=None)),
-        )
+        pending = await get_incoming_duel_request(ctx.author.id)
 
         if not pending:
             await ctx.send(embed=error_embed(ctx, "You have no pending duel requests."), ephemeral=True)
             return
 
-        challenger_id     = pending["challenger_id"]
-        challenger_member = ctx.guild.get_member(challenger_id)
-        if challenger_member is None:
+        challenger_id = pending["challenger_id"]
+
+        # fetch_member hits the API directly — never returns None for a valid member.
+        # get_member only checks the local cache and returns None if the member
+        # isn't cached, which caused the false "left the server" error.
+        try:
+            challenger_member = await ctx.guild.fetch_member(challenger_id)
+        except discord.NotFound:
             await delete_duel_request(challenger_id, ctx.author.id)
             await ctx.send(embed=error_embed(ctx, "The challenger has left the server."), ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            log.warning("acceptduel » fetch_member failed for %s: %s", challenger_id, e)
+            await ctx.send(embed=error_embed(ctx, "Could not resolve the challenger. Try again."), ephemeral=True)
             return
 
         c_row = await get_cultivator(challenger_id)

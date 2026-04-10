@@ -1,28 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import random
 from datetime import datetime, timedelta, timezone
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 from cultivation.breakthrough import attempt_breakthrough
 from cultivation.constants import (
     AFFINITY_DISPLAY,
-    AFFINITY_QI_MULTIPLIER,
     AFFINITIES,
-    BASE_QI_PER_TICK,
-    CLOSED_CULT_MULTIPLIER,
+    AFFINITY_BREAKTHROUGH_MODIFIER,
     REALM_DISPLAY,
-    TICK_INTERVAL_SECONDS,
+    QI_LIVE_UPDATE_INTERVAL,
+    CLOSED_CULT_MULTIPLIER,
+    compute_current_qi,
     get_reputation_title,
 )
 from db import cultivators as db
 from ui.embed import build_embed, error_embed
 
 log = logging.getLogger("bot.cogs.cultivate")
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -57,20 +56,24 @@ async def _check_cooldown(discord_id: int, command: str) -> datetime | None:
 
 
 async def _guard_cultivator(ctx: commands.Context) -> dict | None:
-    """Fetch cultivator row and send error embed if not registered. Returns row or None."""
+    """Fetch cultivator row and send error embed if not registered."""
     try:
         row = await db.get_cultivator(ctx.author.id)
     except Exception:
         log.exception("Cultivate » DB fetch failed for %s", ctx.author.id)
-        await ctx.send(embed=error_embed(ctx, title="Database Error",
-                                         description="Could not fetch your profile. Try again later."),
-                       ephemeral=True)
+        await ctx.send(
+            embed=error_embed(ctx, title="Database Error",
+                              description="Could not fetch your profile. Try again later."),
+            ephemeral=True,
+        )
         return None
 
     if row is None:
-        await ctx.send(embed=error_embed(ctx, title="Not a Cultivator",
-                                         description="You have not yet walked the Path. Use `z!start` to begin."),
-                       ephemeral=True)
+        await ctx.send(
+            embed=error_embed(ctx, title="Not a Cultivator",
+                              description="You have not yet walked the Path. Use `z!start` to begin."),
+            ephemeral=True,
+        )
         return None
 
     return row
@@ -80,10 +83,11 @@ async def _check_closed_cultivation(ctx: commands.Context, row: dict) -> bool:
     """
     If the user is in closed cultivation, cancel it and notify them.
     Returns True if closed cultivation was active (and has been cancelled).
-    Returns False if they were not in closed cultivation.
     """
     closed_until = row.get("closed_cult_until")
     if closed_until and _as_utc(closed_until) > _now():
+        # Flush accrued Qi first so we don't lose progress silently
+        await _flush_qi(row)
         await db.clear_closed_cultivation(ctx.author.id)
         await ctx.send(
             embed=build_embed(
@@ -102,6 +106,124 @@ async def _check_closed_cultivation(ctx: commands.Context, row: dict) -> bool:
     return False
 
 
+async def _flush_qi(row: dict, now: datetime | None = None) -> dict:
+    """
+    Compute how much Qi has accrued since last_updated, write it to the DB,
+    and return the updated row.  Also enters tribulation if threshold is hit.
+    """
+    if now is None:
+        now = _now()
+
+    current_qi, _ = compute_current_qi(
+        qi_stored=row["qi"],
+        qi_threshold=row["qi_threshold"],
+        last_updated=row.get("last_updated"),
+        affinity=row.get("affinity"),
+        closed_cult_until=row.get("closed_cult_until"),
+        now=now,
+    )
+    current_qi = int(current_qi)
+
+    # Persist the flushed value and stamp last_updated = now
+    updated = await db.set_qi(row["discord_id"], current_qi, now)
+
+    # Trigger tribulation if threshold reached
+    if (
+        updated["qi"] >= updated["qi_threshold"]
+        and not updated.get("in_tribulation")
+    ):
+        await db.enter_tribulation(row["discord_id"])
+        updated["in_tribulation"] = True
+
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Live /qi embed builder
+# ---------------------------------------------------------------------------
+
+def _build_qi_embed(
+    ctx_or_interaction,
+    row: dict,
+    now: datetime,
+) -> discord.Embed:
+    current_qi, rate = compute_current_qi(
+        qi_stored=row["qi"],
+        qi_threshold=row["qi_threshold"],
+        last_updated=row.get("last_updated"),
+        affinity=row.get("affinity"),
+        closed_cult_until=row.get("closed_cult_until"),
+        now=now,
+    )
+    current_qi = int(current_qi)
+    threshold  = row["qi_threshold"]
+    affinity   = row.get("affinity") or "none"
+    realm      = row["realm"]
+    stage      = row["stage"]
+    in_trib    = row.get("in_tribulation", False)
+    closed_until = row.get("closed_cult_until")
+
+    # Progress bar (20 chars)
+    pct    = min(current_qi / threshold, 1.0) if threshold else 0.0
+    filled = int(pct * 20)
+    bar    = "█" * filled + "░" * (20 - filled)
+
+    # Time to fill
+    qi_remaining = max(0, threshold - current_qi)
+    if in_trib:
+        ttf_str = "⚡ **Tribulation ready — use `/breakthrough`!**"
+    elif qi_remaining == 0:
+        ttf_str = "Full"
+    elif rate > 0:
+        secs  = qi_remaining / rate
+        hours, rem   = divmod(int(secs), 3600)
+        mins, secs_r = divmod(rem, 60)
+        parts = []
+        if hours:  parts.append(f"{hours}h")
+        if mins:   parts.append(f"{mins}m")
+        if secs_r: parts.append(f"{secs_r}s")
+        ttf_str = " ".join(parts) if parts else "< 1s"
+    else:
+        ttf_str = "—"
+
+    # Closed cultivation status
+    if closed_until and _as_utc(closed_until) > now:
+        cc_str = f"Active — ends <t:{int(_as_utc(closed_until).timestamp())}:R>"
+    else:
+        cc_str = "Inactive"
+
+    affinity_label = AFFINITY_DISPLAY.get(affinity, affinity.title()) if affinity != "none" else "Not chosen"
+    realm_label    = REALM_DISPLAY.get(realm, realm) if realm else "Unknown"
+
+    desc = (
+        f"**Realm:** {realm_label} — Stage {stage}\n"
+        f"**Affinity:** {affinity_label}\n\n"
+        f"`{bar}` **{pct * 100:.1f}%**\n"
+        f"**Qi:** `{current_qi:,} / {threshold:,}`\n"
+        f"**Qi/sec:** `{rate:.3f}`\n"
+        f"**Time to fill:** {ttf_str}\n\n"
+        f"**Closed Cultivation:** {cc_str}\n"
+        f"**Tribulation:** {'⚡ Pending — use `/breakthrough`!' if in_trib else 'Not yet'}\n\n"
+        f"-# Updates every {QI_LIVE_UPDATE_INTERVAL}s"
+    )
+
+    # Determine author name from context or interaction
+    display_name = getattr(
+        getattr(ctx_or_interaction, "author", None)
+        or getattr(ctx_or_interaction, "user", None),
+        "display_name", "Cultivator"
+    )
+
+    return build_embed(
+        ctx_or_interaction,
+        title=f"🔮 {display_name}'s Qi Status",
+        description=desc,
+        color=discord.Color.blurple(),
+        show_footer=True,
+        show_timestamp=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
@@ -109,79 +231,13 @@ async def _check_closed_cultivation(ctx: commands.Context, row: dict) -> bool:
 class Cultivate(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.passive_tick.start()
-
-    def cog_unload(self) -> None:
-        self.passive_tick.cancel()
-
-    # ------------------------------------------------------------------
-    # Passive tick loop
-    # ------------------------------------------------------------------
-
-    @tasks.loop(seconds=TICK_INTERVAL_SECONDS)
-    async def passive_tick(self) -> None:
-        """Award passive Qi to all cultivators every tick interval."""
-        try:
-            cultivators = await db.get_all_cultivators()
-        except Exception:
-            log.exception("Passive tick » Failed to fetch cultivators")
-            return
-
-        now = _now()
-        for row in cultivators:
-            try:
-                await self._process_tick(row, now)
-            except Exception:
-                log.exception("Passive tick » Failed for discord_id=%s", row["discord_id"])
-
-    @passive_tick.before_loop
-    async def before_tick(self) -> None:
-        await self.bot.wait_until_ready()
-
-    async def _process_tick(self, row: dict, now: datetime) -> None:
-        discord_id = row["discord_id"]
-        affinity   = row["affinity"] or "water"
-
-        # Skip if in tribulation (Qi is full / locked)
-        if row["in_tribulation"]:
-            return
-
-        # Qi multiplier from affinity
-        multiplier = AFFINITY_QI_MULTIPLIER.get(affinity, 1.0)
-
-        # Double if in closed cultivation and buff hasn't expired
-        closed_until = row["closed_cult_until"]
-        if closed_until and _as_utc(closed_until) > now:
-            multiplier *= CLOSED_CULT_MULTIPLIER
-        elif closed_until and _as_utc(closed_until) <= now:
-            # Buff expired — clear it
-            await db.clear_closed_cultivation(discord_id)
-
-        qi_gain = max(1, int(BASE_QI_PER_TICK * multiplier))
-        updated = await db.add_qi(discord_id, qi_gain)
-        await db.update_tick(discord_id)
-
-        # Check if Qi just hit the threshold → enter tribulation
-        if updated["qi"] >= updated["qi_threshold"] and not updated["in_tribulation"]:
-            await db.enter_tribulation(discord_id)
-            log.info("Passive tick » discord_id=%s entered tribulation", discord_id)
-
-            # DM the cultivator
-            user = self.bot.get_user(discord_id)
-            if user:
-                try:
-                    await user.send(
-                        "⚡ **Tribulation Approaches.** Your Qi has reached its limit. "
-                        "Use `/breakthrough` within 24 hours or your energy will begin to destabilise."
-                    )
-                except discord.Forbidden:
-                    pass
 
     # ------------------------------------------------------------------
     # /choose_affinity
     # ------------------------------------------------------------------
 
-    @commands.hybrid_command(name="choose_affinity", description="Choose your elemental affinity (once only)")
+    @commands.hybrid_command(name="choose_affinity",
+                             description="Choose your elemental affinity (once only)")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def choose_affinity(self, ctx: commands.Context) -> None:
         if ctx.interaction:
@@ -196,7 +252,10 @@ class Cultivate(commands.Cog):
                 embed=error_embed(
                     ctx,
                     title="Affinity Already Chosen",
-                    description=f"Your path is already attuned to **{AFFINITY_DISPLAY[row['affinity']]}**. This cannot be changed.",
+                    description=(
+                        f"Your path is already attuned to **{AFFINITY_DISPLAY[row['affinity']]}**. "
+                        "This cannot be changed."
+                    ),
                 ),
                 ephemeral=True,
             )
@@ -210,10 +269,10 @@ class Cultivate(commands.Cog):
                 "Your affinity shapes every aspect of your cultivation.\n"
                 "It affects your Qi gain, breakthrough odds, and combat power.\n\n"
                 "**This choice is permanent.**\n\n"
-                "🔥 **Fire** — +15% Qi gain. Breakthroughs are unstable but powerful.\n"
+                "🔥 **Fire** — +15% Qi/sec. Breakthroughs are unstable but powerful.\n"
                 "💧 **Water** — Smooth progression. Breakthroughs are safer.\n"
                 "⚡ **Lightning** — Volatile. Hardest breakthroughs, but rare stage skips.\n"
-                "🌿 **Wood** — +10% Qi gain. Steady and resilient.\n"
+                "🌿 **Wood** — +10% Qi/sec. Steady and resilient.\n"
                 "🪨 **Earth** — Tanky. Slower Qi gain, best combat stability."
             ),
             color=discord.Color.blurple(),
@@ -221,10 +280,11 @@ class Cultivate(commands.Cog):
         await ctx.send(embed=embed, view=view, ephemeral=True)
 
     # ------------------------------------------------------------------
-    # /qi  —  Qi progress overview
+    # /qi  —  live Qi progress (updates every QI_LIVE_UPDATE_INTERVAL sec)
     # ------------------------------------------------------------------
 
-    @commands.hybrid_command(name="qi", description="Check your current Qi progress and cultivation status")
+    @commands.hybrid_command(name="qi",
+                             description="Check your current Qi progress (live, updates every 5s)")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def qi(self, ctx: commands.Context) -> None:
         if ctx.interaction:
@@ -234,79 +294,64 @@ class Cultivate(commands.Cog):
         if row is None:
             return
 
-        current_qi   = row["qi"]
-        threshold    = row["qi_threshold"]
-        affinity     = row["affinity"] or "none"
-        realm        = row["realm"]
-        stage        = row["stage"]
-        in_trib      = row["in_tribulation"]
-        closed_until = row["closed_cult_until"]
+        now = _now()
+        embed = _build_qi_embed(ctx, row, now)
+        message = await ctx.send(embed=embed)
 
-        # Progress bar (20 chars wide)
-        pct    = min(current_qi / threshold, 1.0) if threshold else 0
-        filled = int(pct * 20)
-        bar    = "█" * filled + "░" * (20 - filled)
+        # Live-update loop — runs for 60 seconds (12 × 5 s ticks)
+        for _ in range(12):
+            await asyncio.sleep(QI_LIVE_UPDATE_INTERVAL)
 
-        # Estimate time-to-fill based on passive tick rate
-        multiplier = AFFINITY_QI_MULTIPLIER.get(affinity, 1.0)
-        if closed_until and _as_utc(closed_until) > _now():
-            multiplier *= CLOSED_CULT_MULTIPLIER
-        qi_per_tick  = max(1, int(BASE_QI_PER_TICK * multiplier))
-        qi_remaining = max(0, threshold - current_qi)
+            # Re-fetch row so closed-cult and tribulation flags are current
+            try:
+                row = await db.get_cultivator(ctx.author.id)
+            except Exception:
+                break
+            if row is None:
+                break
 
-        if in_trib:
-            ttf_str = "⚡ **Tribulation ready — use `/breakthrough`!**"
-        elif qi_remaining == 0:
-            ttf_str = "Full"
-        elif qi_per_tick > 0:
-            ticks_needed   = (qi_remaining + qi_per_tick - 1) // qi_per_tick
-            seconds_needed = ticks_needed * TICK_INTERVAL_SECONDS
-            hours, rem     = divmod(seconds_needed, 3600)
-            minutes, secs  = divmod(rem, 60)
-            parts = []
-            if hours:   parts.append(f"{hours}h")
-            if minutes: parts.append(f"{minutes}m")
-            if secs:    parts.append(f"{secs}s")
-            ttf_str = " ".join(parts) if parts else "< 1s"
-        else:
-            ttf_str = "—"
-
-        # Closed cultivation status
-        if closed_until and _as_utc(closed_until) > _now():
-            cc_str = f"Active — ends <t:{int(_as_utc(closed_until).timestamp())}:R>"
-        else:
-            cc_str = "Inactive"
-
-        affinity_label = AFFINITY_DISPLAY.get(affinity, affinity.title()) if affinity != "none" else "Not chosen"
-        realm_label    = REALM_DISPLAY.get(realm, realm) if realm else "Unknown"
-
-        desc = (
-            f"**Realm:** {realm_label} — Stage {stage}\n"
-            f"**Affinity:** {affinity_label}\n\n"
-            f"`{bar}` **{pct * 100:.1f}%**\n"
-            f"**Qi:** `{current_qi:,} / {threshold:,}`\n"
-            f"**Qi per tick:** `{qi_per_tick}`\n"
-            f"**Time to fill:** {ttf_str}\n\n"
-            f"**Closed Cultivation:** {cc_str}\n"
-            f"**Tribulation:** {'⚡ Pending — use `/breakthrough`!' if in_trib else 'Not yet'}"
-        )
-
-        await ctx.send(
-            embed=build_embed(
-                ctx,
-                title=f"🔮 {ctx.author.display_name}'s Qi Status",
-                description=desc,
-                color=discord.Color.blurple(),
-                show_footer=True,
-                show_timestamp=True,
+            # Check if tribulation was just entered on the server side
+            now = _now()
+            current_qi, _ = compute_current_qi(
+                qi_stored=row["qi"],
+                qi_threshold=row["qi_threshold"],
+                last_updated=row.get("last_updated"),
+                affinity=row.get("affinity"),
+                closed_cult_until=row.get("closed_cult_until"),
+                now=now,
             )
-        )
+
+            # Auto-enter tribulation if threshold hit and not yet flagged
+            if (
+                int(current_qi) >= row["qi_threshold"]
+                and not row.get("in_tribulation")
+            ):
+                await db.enter_tribulation(row["discord_id"])
+                row["in_tribulation"] = True
+
+                user = self.bot.get_user(ctx.author.id)
+                if user:
+                    try:
+                        await user.send(
+                            "⚡ **Tribulation Approaches.** Your Qi has reached its limit. "
+                            "Use `/breakthrough` before your energy destabilises."
+                        )
+                    except discord.Forbidden:
+                        pass
+
+            try:
+                await message.edit(embed=_build_qi_embed(ctx, row, now))
+            except discord.NotFound:
+                break
+            except discord.HTTPException:
+                break
 
     # ------------------------------------------------------------------
     # /meditate
     # ------------------------------------------------------------------
 
-    @commands.hybrid_command(name="meditate", description="Meditate for a small burst of Qi (1h cooldown)")
+    @commands.hybrid_command(name="meditate",
+                             description="Meditate for a burst of Qi (1h cooldown)")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def meditate(self, ctx: commands.Context) -> None:
         if ctx.interaction:
@@ -317,16 +362,16 @@ class Cultivate(commands.Cog):
             return
 
         if row["affinity"] is None:
-            await ctx.send(embed=error_embed(ctx, title="No Affinity",
-                                             description="Choose your affinity first with `/choose_affinity`."),
-                           ephemeral=True)
+            await ctx.send(
+                embed=error_embed(ctx, title="No Affinity",
+                                  description="Choose your affinity first with `/choose_affinity`."),
+                ephemeral=True,
+            )
             return
 
-        # Cancel closed cultivation if active, then stop
         if await _check_closed_cultivation(ctx, row):
             return
 
-        # Cooldown check
         expires = await _check_cooldown(ctx.author.id, "meditate")
         if expires:
             await ctx.send(
@@ -336,7 +381,6 @@ class Cultivate(commands.Cog):
             )
             return
 
-        # Can't meditate while in tribulation
         if row["in_tribulation"]:
             await ctx.send(
                 embed=error_embed(ctx, title="In Tribulation",
@@ -345,14 +389,24 @@ class Cultivate(commands.Cog):
             )
             return
 
-        affinity   = row["affinity"]
-        multiplier = AFFINITY_QI_MULTIPLIER.get(affinity, 1.0)
-        qi_gain    = max(1, int(BASE_QI_PER_TICK * 1.5 * multiplier))  # 1.5x a normal tick
+        # Flush accrued Qi first so we add on top of the real current value
+        now     = _now()
+        updated = await _flush_qi(row, now)
+
+        # Meditate bonus: 90 seconds worth of Qi at current rate (1.5× one tick)
+        _, rate  = compute_current_qi(
+            qi_stored=updated["qi"],
+            qi_threshold=updated["qi_threshold"],
+            last_updated=now,          # just flushed
+            affinity=row.get("affinity"),
+            closed_cult_until=row.get("closed_cult_until"),
+            now=now,
+        )
+        qi_gain = max(1, int(rate * 90))   # ~1.5× a 60-second window
 
         updated = await db.add_qi(ctx.author.id, qi_gain)
-        await db.set_cooldown(ctx.author.id, "meditate", _now() + timedelta(hours=1))
+        await db.set_cooldown(ctx.author.id, "meditate", now + timedelta(hours=1))
 
-        # Check if this push hit the threshold
         entered_tribulation = False
         if updated["qi"] >= updated["qi_threshold"] and not row["in_tribulation"]:
             await db.enter_tribulation(ctx.author.id)
@@ -361,7 +415,7 @@ class Cultivate(commands.Cog):
         desc = (
             f"You sink into stillness. The world fades.\n\n"
             f"**+{qi_gain} Qi** absorbed.\n"
-            f"Current Qi: `{updated['qi']} / {updated['qi_threshold']}`"
+            f"Current Qi: `{updated['qi']:,} / {updated['qi_threshold']:,}`"
         )
         if entered_tribulation:
             desc += "\n\n⚡ **Your Qi has reached its limit. Tribulation approaches — use `/breakthrough`.**"
@@ -381,7 +435,7 @@ class Cultivate(commands.Cog):
     # ------------------------------------------------------------------
 
     @commands.hybrid_command(name="closed_cultivation",
-                             description="Enter closed cultivation for 4h — 2x Qi gain, but you're vulnerable")
+                             description="Enter closed cultivation for 4h — 2× Qi rate, but you're vulnerable")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def closed_cultivation(self, ctx: commands.Context) -> None:
         if ctx.interaction:
@@ -392,12 +446,13 @@ class Cultivate(commands.Cog):
             return
 
         if row["affinity"] is None:
-            await ctx.send(embed=error_embed(ctx, title="No Affinity",
-                                             description="Choose your affinity first with `/choose_affinity`."),
-                           ephemeral=True)
+            await ctx.send(
+                embed=error_embed(ctx, title="No Affinity",
+                                  description="Choose your affinity first with `/choose_affinity`."),
+                ephemeral=True,
+            )
             return
 
-        # Already in closed cultivation?
         if row["closed_cult_until"] and _as_utc(row["closed_cult_until"]) > _now():
             remaining = _format_cooldown(row["closed_cult_until"])
             await ctx.send(
@@ -415,7 +470,6 @@ class Cultivate(commands.Cog):
             )
             return
 
-        # Cooldown check
         expires = await _check_cooldown(ctx.author.id, "closed_cultivation")
         if expires:
             await ctx.send(
@@ -424,6 +478,9 @@ class Cultivate(commands.Cog):
                 ephemeral=True,
             )
             return
+
+        # Flush Qi at current (non-boosted) rate before starting the 2× window
+        await _flush_qi(row)
 
         until = _now() + timedelta(hours=4)
         await db.set_closed_cultivation(ctx.author.id, until)
@@ -435,7 +492,7 @@ class Cultivate(commands.Cog):
                 title="🔒 Closed Cultivation Begun",
                 description=(
                     "You seal yourself away from the world.\n\n"
-                    "**2× Qi gain** for the next **4 hours**.\n"
+                    "**2× Qi rate** for the next **4 hours**.\n"
                     "⚠️ Using **any command** will **break your seclusion** and cancel the bonus.\n"
                     "⚠️ You are **vulnerable to ambush** while in seclusion.\n\n"
                     f"You will emerge at <t:{int(until.timestamp())}:t>."
@@ -460,24 +517,33 @@ class Cultivate(commands.Cog):
         if row is None:
             return
 
-        # Cancel closed cultivation if active, then stop
         if await _check_closed_cultivation(ctx, row):
             return
 
         if row["stabilise_used"]:
             await ctx.send(
-                embed=error_embed(ctx, title="Already Used",
-                                  description="You have already stabilised your foundation this realm. "
-                                              "It resets when you advance to the next realm."),
+                embed=error_embed(
+                    ctx,
+                    title="Already Used",
+                    description=(
+                        "You have already stabilised your foundation this realm. "
+                        "It resets when you advance to the next realm."
+                    ),
+                ),
                 ephemeral=True,
             )
             return
 
         if not row["in_tribulation"]:
             await ctx.send(
-                embed=error_embed(ctx, title="Not in Tribulation",
-                                  description="You can only stabilise when your Qi has reached its threshold "
-                                              "and tribulation is imminent."),
+                embed=error_embed(
+                    ctx,
+                    title="Not in Tribulation",
+                    description=(
+                        "You can only stabilise when your Qi has reached its threshold "
+                        "and tribulation is imminent."
+                    ),
+                ),
                 ephemeral=True,
             )
             return
@@ -514,33 +580,43 @@ class Cultivate(commands.Cog):
             return
 
         if row["affinity"] is None:
-            await ctx.send(embed=error_embed(ctx, title="No Affinity",
-                                             description="Choose your affinity first with `/choose_affinity`."),
-                           ephemeral=True)
+            await ctx.send(
+                embed=error_embed(ctx, title="No Affinity",
+                                  description="Choose your affinity first with `/choose_affinity`."),
+                ephemeral=True,
+            )
             return
 
-        # Cancel closed cultivation if active, then stop
         if await _check_closed_cultivation(ctx, row):
             return
 
-        # Must be in tribulation
+        # Flush Qi so in_tribulation is accurate before we check it
+        row = await _flush_qi(row)
+
         if not row["in_tribulation"]:
-            qi_needed = row["qi_threshold"] - row["qi"]
+            # Compute display qi for the error message
+            current_qi, _ = compute_current_qi(
+                qi_stored=row["qi"],
+                qi_threshold=row["qi_threshold"],
+                last_updated=row.get("last_updated"),
+                affinity=row.get("affinity"),
+                closed_cult_until=row.get("closed_cult_until"),
+            )
+            qi_needed = row["qi_threshold"] - int(current_qi)
             await ctx.send(
                 embed=error_embed(
                     ctx,
                     title="Not Ready",
                     description=(
                         f"Your Qi has not reached its threshold.\n\n"
-                        f"Current: `{row['qi']} / {row['qi_threshold']}`\n"
-                        f"Still need: `{qi_needed}` Qi"
+                        f"Current: `{int(current_qi):,} / {row['qi_threshold']:,}`\n"
+                        f"Still need: `{max(0, qi_needed):,}` Qi"
                     ),
                 ),
                 ephemeral=True,
             )
             return
 
-        # Cooldown check (from a recent failed attempt)
         expires = await _check_cooldown(ctx.author.id, "breakthrough")
         if expires:
             await ctx.send(
@@ -550,18 +626,15 @@ class Cultivate(commands.Cog):
             )
             return
 
-        # Resolve
         result = await attempt_breakthrough(row)
 
-        # If cooldown was set by the attempt, stamp it
         if result.cooldown_end:
             await db.set_cooldown(ctx.author.id, "breakthrough", result.cooldown_end)
 
-        # Build embed
         if result.outcome == "success":
             color = discord.Color.gold() if result.overflow else discord.Color.green()
             title = "⚡ Qi Overflow — Double Advance!" if result.overflow else "✅ Breakthrough Success"
-        else:  # "fail"
+        else:
             color = discord.Color.red()
             title = "❌ Breakthrough Failed"
 
@@ -577,14 +650,8 @@ class Cultivate(commands.Cog):
                 "inline": True,
             },
         ]
-
         if result.qi_lost:
-            fields.append({
-                "name": "Qi Lost",
-                "value": f"`{result.qi_lost}`",
-                "inline": True,
-            })
-
+            fields.append({"name": "Qi Lost", "value": f"`{result.qi_lost}`", "inline": True})
         if result.cooldown_end:
             fields.append({
                 "name": "Next Attempt",
@@ -592,19 +659,18 @@ class Cultivate(commands.Cog):
                 "inline": True,
             })
 
-        embed = build_embed(
-            ctx,
-            title=title,
-            description=result.message,
-            color=color,
-            fields=fields,
-            show_footer=True,
-            show_timestamp=True,
+        await ctx.send(
+            embed=build_embed(
+                ctx,
+                title=title,
+                description=result.message,
+                color=color,
+                fields=fields,
+                show_footer=True,
+                show_timestamp=True,
+            )
         )
 
-        await ctx.send(embed=embed)
-
-        # Announce Qi Overflow publicly
         if result.overflow:
             log.info(
                 "Breakthrough » Qi Overflow! discord_id=%s %s S%d → %s S%d",
@@ -623,7 +689,6 @@ class _AffinitySelectView(discord.ui.View):
         super().__init__(timeout=60)
         self.ctx = ctx
         self.row = row
-
         for affinity in AFFINITIES:
             self.add_item(_AffinityButton(affinity))
 
@@ -642,9 +707,8 @@ class _AffinityButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await db.set_affinity(interaction.user.id, self.affinity)
-
         embed = build_embed(
-            interaction,  # type: ignore[arg-type]
+            interaction,          # type: ignore[arg-type]
             title="⚗️ Affinity Chosen",
             description=(
                 f"Your soul resonates with **{AFFINITY_DISPLAY[self.affinity]}**.\n\n"
@@ -653,7 +717,7 @@ class _AffinityButton(discord.ui.Button):
             color=discord.Color.green(),
         )
         await interaction.response.edit_message(embed=embed, view=None)
-        self.view.stop()  # type: ignore[union-attr]
+        self.view.stop()          # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------

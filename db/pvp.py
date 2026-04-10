@@ -100,6 +100,18 @@ async def get_duel_request(challenger_id: int, target_id: int) -> dict | None:
     )
 
 
+async def get_incoming_duel_request(target_id: int) -> dict | None:
+    """Fetch any active duel request targeting this user."""
+    return await fetch_one(
+        """
+        SELECT * FROM pending_duels
+        WHERE target_id = %s AND expires_at > %s AND accepted = FALSE
+        ORDER BY requested_at DESC LIMIT 1
+        """,
+        (target_id, datetime.now(timezone.utc).replace(tzinfo=None)),
+    )
+
+
 async def accept_duel(challenger_id: int, target_id: int) -> None:
     await execute(
         "UPDATE pending_duels SET accepted = TRUE WHERE challenger_id = %s AND target_id = %s",

@@ -1,3 +1,23 @@
+"""
+cultivation/breakthrough.py
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Core breakthrough resolution.
+
+Changes in this revision
+────────────────────────
+• Spirit Root bonuses are now injected here alongside talent bonuses.
+  The caller (cultivate.py) should pass ``root_value`` (int | None) so the
+  engine can merge root bonuses into the combined bonus set.
+• ``attempt_breakthrough`` signature gains one new optional parameter:
+  ``root_value: int | None = None``
+
+  If you are not yet ready to thread ``root_value`` through your cog, it
+  defaults to ``None`` which means no root bonus is applied — fully backward-
+  compatible.
+
+• The merge uses ``spirit_roots.cultivation_bridge.merge_bonuses`` which
+  combines talent and root bonuses, applying hard caps after merging.
+"""
 from __future__ import annotations
 
 import random
@@ -10,6 +30,7 @@ from cultivation.constants import (
     FAIL_CONSEQUENCES,
 )
 from db import cultivators as db
+from talent.cultivation_bridge import get_spirit_root_bonuses, merge_bonuses
 
 
 # ---------------------------------------------------------------------------
@@ -18,16 +39,16 @@ from db import cultivators as db
 
 @dataclass(slots=True)
 class BreakthroughResult:
-    outcome:      str             # "success" | "fail"
-    overflow:     bool            # True → double-stage advance
-    qi_lost:      int
-    cooldown_end: datetime | None
-    realm_before: str
-    stage_before: int
-    realm_after:  str
-    stage_after:  int
-    message:      str             # flavour text for the embed
-    qi_loss_negated: bool = False # True → talent rebirth bonus triggered
+    outcome:         str             # "success" | "fail"
+    overflow:        bool            # True → double-stage advance
+    qi_lost:         int
+    cooldown_end:    datetime | None
+    realm_before:    str
+    stage_before:    int
+    realm_after:     str
+    stage_after:     int
+    message:         str             # flavour text for the embed
+    qi_loss_negated: bool = False    # True → talent/root rebirth bonus triggered
 
 
 # ---------------------------------------------------------------------------
@@ -36,26 +57,33 @@ class BreakthroughResult:
 
 async def attempt_breakthrough(
     row: dict,
-    talent_breakthrough_bonus: float = 0.0,   # additive % points from active talent tags
-    talent_overflow_chance:    float = 0.05,   # absolute probability (replaces default)
-    talent_negate_qi_loss:     float = 0.0,    # 0.0–1.0 chance to negate Qi loss on fail
+    talent_breakthrough_bonus: float = 0.0,
+    talent_overflow_chance:    float = 0.05,
+    talent_negate_qi_loss:     float = 0.0,
+    *,
+    root_value: int | None = None,
 ) -> BreakthroughResult:
     """
     Resolve a breakthrough attempt for the given (already-flushed) cultivator row.
 
-    Talent bonuses are injected by the caller (cultivate.py) via
-    ``talent/cultivation_bridge.get_cultivation_bonuses()``.
-
-    Contract with the caller (cultivate.py):
-    - ``row`` must have been produced by ``_flush_qi`` immediately before this
-      call so that ``row["qi"]`` reflects live Qi and ``row["in_tribulation"]``
-      is accurate.
-    - The caller is responsible for setting the breakthrough cooldown via
-      ``db.set_cooldown`` after this function returns, using ``result.cooldown_end``.
+    Parameters
+    ----------
+    row:
+        Cultivator DB row produced by ``_flush_qi`` immediately before this call.
+    talent_breakthrough_bonus:
+        Additive percentage points from ``talent.cultivation_bridge``.
+    talent_overflow_chance:
+        Absolute overflow probability from ``talent.cultivation_bridge``.
+    talent_negate_qi_loss:
+        0.0–1.0 chance from ``talent.cultivation_bridge``.
+    root_value:
+        The player's current Spirit Root tier value (1–5), or ``None``.
+        When supplied, root bonuses are merged with the talent bonuses using
+        ``spirit_roots.cultivation_bridge.merge_bonuses`` before applying caps.
 
     Side-effects applied here:
     - Stage advance (success path)
-    - Qi loss (fail path, unless negated by talent)
+    - Qi loss (fail path, unless negated)
     - Tribulation exit (both paths)
     - Breakthrough audit log entry (both paths)
 
@@ -65,25 +93,40 @@ async def attempt_breakthrough(
     realm      = row["realm"]
     stage      = row["stage"]
     affinity   = row["affinity"] or "water"
-    stabilised = row["stabilise_used"]  # False → bonus not yet consumed
+    stabilised = row["stabilise_used"]
 
-    now = datetime.now(timezone.utc)    # single timestamp for this entire operation
+    now = datetime.now(timezone.utc)
 
-    # ── Build adjusted success chance ──────────────────────────────────────
+    # ── Merge talent + Spirit Root bonuses ──────────────────────────────────
+    talent_bonuses: dict[str, float] = {
+        "qi_multiplier":          1.0,                      # not used here but required by merge
+        "breakthrough_bonus":     talent_breakthrough_bonus,
+        "overflow_chance":        talent_overflow_chance,
+        "negate_qi_loss_chance":  talent_negate_qi_loss,
+        "meditate_cooldown_mult": 1.0,                      # not used here
+        "qi_threshold_bonus":     0.0,                      # not used here
+    }
+    root_bonuses  = get_spirit_root_bonuses(root_value)
+    combined      = merge_bonuses(talent_bonuses, root_bonuses)
+
+    breakthrough_bonus  = combined["breakthrough_bonus"]
+    overflow_chance     = combined["overflow_chance"]
+    negate_qi_loss      = combined["negate_qi_loss_chance"]
+
+    # ── Build adjusted success chance ─────────────────────────────────────
     base_success   = BREAKTHROUGH_ODDS[realm]
     affinity_mod   = AFFINITY_BREAKTHROUGH_MODIFIER.get(affinity, 0.0)
     stabilise_mod  = 10.0 if not stabilised else 0.0
     success_chance = min(
-        base_success + affinity_mod + stabilise_mod + talent_breakthrough_bonus,
+        base_success + affinity_mod + stabilise_mod + breakthrough_bonus,
         97.0,
     )
 
     roll = random.uniform(0, 100)
 
-    # ── Success ────────────────────────────────────────────────────────────
+    # ── Success ─────────────────────────────────────────────────────────────
     if roll < success_chance:
-        # Talent-influenced overflow chance replaces the hard-coded 0.05 default.
-        overflow = random.random() < talent_overflow_chance
+        overflow = random.random() < overflow_chance
 
         updated = await db.advance_stage(discord_id, row)
         if overflow:
@@ -106,16 +149,15 @@ async def attempt_breakthrough(
             message=_success_message(realm, overflow),
         )
 
-    # ── Failure ────────────────────────────────────────────────────────────
+    # ── Failure ─────────────────────────────────────────────────────────────
     loss_pct, cd_minutes = FAIL_CONSEQUENCES[realm]
 
     qi_loss_negated = (
-        talent_negate_qi_loss > 0
-        and random.random() < talent_negate_qi_loss
+        negate_qi_loss > 0
+        and random.random() < negate_qi_loss
     )
 
     if qi_loss_negated:
-        # Talent absorbed the backlash — update timestamp only, no Qi removed.
         updated = await db.set_qi(discord_id, row["qi"], now)
         qi_lost = 0
     else:
@@ -194,7 +236,7 @@ def _success_message(realm: str, overflow: bool) -> str:
 def _fail_message(realm: str, affinity: str, negated: bool) -> str:
     if negated:
         return (
-            "❌ **Breakthrough Failed — but your talent held firm.** "
+            "❌ **Breakthrough Failed — but your root held firm.** "
             "The tribulation energy scattered against your innate power. "
             "Your Qi was preserved. The Path endures."
         )

@@ -17,9 +17,11 @@ from cultivation.constants import (
 )
 from db import cultivators as db
 from db import talent as talent_db
+from db import spirit_roots as spirit_roots_db
 from talent.cultivation_bridge import get_cultivation_bonuses, describe_bonuses
 from talent.models import PlayerTalent, PlayerTalentData
 from ui.embed import build_embed, error_embed
+from ui.interaction_utils import safe_defer, safe_edit
 
 log = logging.getLogger("bot.cogs.cultivate")
 
@@ -45,7 +47,6 @@ def _format_cooldown(expires: datetime) -> str:
 
 
 async def _check_cooldown(discord_id: int, command: str) -> datetime | None:
-    """Return expiry datetime if the command is still on cooldown, else None."""
     expires = await db.get_cooldown(discord_id, command)
     if expires and _as_utc(expires) > _now():
         return expires
@@ -53,10 +54,6 @@ async def _check_cooldown(discord_id: int, command: str) -> datetime | None:
 
 
 async def _guard_cultivator(ctx: commands.Context) -> dict | None:
-    """
-    Fetch the cultivator row for ``ctx.author``.
-    Sends an appropriate error embed and returns None on any failure.
-    """
     try:
         row = await db.get_cultivator(ctx.author.id)
     except Exception:
@@ -89,10 +86,6 @@ async def _load_talent_bonuses(
     discord_id: int,
     guild_id: int,
 ) -> tuple[dict[str, float], PlayerTalent | None]:
-    """
-    Load the player's active talent and return (bonuses dict, active_talent).
-    Falls back to identity bonuses (no effect) and None talent on any error.
-    """
     try:
         player_data: PlayerTalentData | None = await talent_db.get_player_talent_data(
             discord_id, guild_id
@@ -108,10 +101,6 @@ async def _load_talent_bonuses(
 
 
 async def _flush_qi(row: dict, bonuses: dict[str, float], now: datetime | None = None) -> dict:
-    """
-    Compute accrued Qi since ``row["last_updated"]``, persist it, and return
-    the updated row.  Enters tribulation automatically if the threshold is met.
-    """
     if now is None:
         now = _now()
 
@@ -140,10 +129,6 @@ async def _flush_qi(row: dict, bonuses: dict[str, float], now: datetime | None =
 async def _break_closed_cultivation(
     ctx: commands.Context, row: dict, bonuses: dict[str, float]
 ) -> bool:
-    """
-    If the user is in active closed cultivation, cancel it (flushing Qi first)
-    and notify them.  Returns True if closed cultivation was active.
-    """
     closed_until = row.get("closed_cult_until")
     if not (closed_until and _as_utc(closed_until) > _now()):
         return False
@@ -222,7 +207,6 @@ def _build_qi_embed(
     affinity_label = AFFINITY_DISPLAY.get(affinity, affinity.title()) if affinity else "Not chosen"
     realm_label    = REALM_DISPLAY.get(row["realm"], row["realm"])
 
-    # Talent line — always shown; bonus details appended only when active
     if active_talent is None:
         talent_line = "\n**Talent:** *None*"
     else:
@@ -288,7 +272,7 @@ class Cultivate(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def qi(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -300,7 +284,7 @@ class Cultivate(commands.Cog):
         now     = _now()
         message = await ctx.send(embed=_build_qi_embed(ctx, row, now, bonuses, active_talent))
 
-        for _ in range(12):  # live-update for 60 s (12 × 5 s ticks)
+        for _ in range(12):
             await asyncio.sleep(QI_LIVE_UPDATE_INTERVAL)
 
             try:
@@ -351,7 +335,7 @@ class Cultivate(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def meditate(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -406,7 +390,7 @@ class Cultivate(commands.Cog):
             talent_multiplier=bonuses["qi_multiplier"],
             now=now,
         )
-        qi_gain = max(1, int(rate * 90))  # ~1.5× a 60-second window
+        qi_gain = max(1, int(rate * 90))
 
         updated = await db.add_qi(ctx.author.id, qi_gain, now=now)
 
@@ -459,7 +443,7 @@ class Cultivate(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def closed_cultivation(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -541,7 +525,7 @@ class Cultivate(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def stabilise(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -606,7 +590,7 @@ class Cultivate(commands.Cog):
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def breakthrough(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -658,11 +642,15 @@ class Cultivate(commands.Cog):
             )
             return
 
+        _root_record = await spirit_roots_db.get_spirit_root(ctx.author.id, guild_id)
+        _root_value  = _root_record.current_value if _root_record else None
+
         result = await attempt_breakthrough(
             row,
             talent_breakthrough_bonus=bonuses["breakthrough_bonus"],
             talent_overflow_chance=bonuses["overflow_chance"],
             talent_negate_qi_loss=bonuses["negate_qi_loss_chance"],
+            root_value=_root_value,
         )
 
         if result.cooldown_end:
@@ -750,7 +738,8 @@ class _AffinityButton(discord.ui.Button):
 
         await db.set_affinity(interaction.user.id, self.affinity)
 
-        await interaction.response.edit_message(
+        await safe_edit(
+            interaction,
             embed=build_embed(
                 interaction,  # type: ignore[arg-type]
                 title="⚗️ Affinity Chosen",

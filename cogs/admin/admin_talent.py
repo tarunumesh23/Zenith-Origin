@@ -26,6 +26,7 @@ from talent.constants import RARITIES, SPIN_PITY
 from talent.models import PlayerTalent, PlayerTalentData
 from db import talent as db
 from ui.embed import build_embed, error_embed
+from ui.interaction_utils import safe_defer
 
 log = logging.getLogger("bot.cogs.admin_talent")
 
@@ -74,12 +75,8 @@ class AdminTalent(commands.Cog):
         member: discord.Member,
         amount: int = 1,
     ) -> None:
-        """
-        Add `amount` spin tokens to `member`'s balance.
-        Only mods with manage_guild can use this.
-        """
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         if amount < 1:
             await ctx.send(
@@ -131,12 +128,8 @@ class AdminTalent(commands.Cog):
         member: discord.Member,
         amount: int = 1,
     ) -> None:
-        """
-        Remove up to `amount` spin tokens from `member`'s balance.
-        Will not reduce below zero — excess is silently clamped.
-        """
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         if amount < 1:
             await ctx.send(
@@ -148,7 +141,7 @@ class AdminTalent(commands.Cog):
 
         guild_id      = ctx.guild.id if ctx.guild else 0
         current       = await db.get_spin_tokens(member.id, guild_id)
-        actual_remove = min(amount, current)   # clamp to available balance
+        actual_remove = min(amount, current)
 
         if actual_remove == 0:
             await ctx.send(
@@ -187,7 +180,7 @@ class AdminTalent(commands.Cog):
     @commands.has_permissions(manage_guild=True)
     async def admin_view(self, ctx: commands.Context, member: discord.Member) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         guild_id = ctx.guild.id if ctx.guild else 0
         player   = await _load_player(member.id, guild_id)
@@ -200,7 +193,6 @@ class AdminTalent(commands.Cog):
             f"**Fusion pity counter:** {player.fusion_pity}",
         ]
 
-        # Spin pity
         pity_parts = ", ".join(
             f"{tier}: {player.spin_pity.get(tier, 0)}"
             for tier in SPIN_PITY
@@ -251,7 +243,7 @@ class AdminTalent(commands.Cog):
     async def admin_reset(self, ctx: commands.Context, member: discord.Member) -> None:
         """Requires administrator (not just manage_guild) — destructive action."""
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         guild_id = ctx.guild.id if ctx.guild else 0
         await db.reset_player_talent_data(member.id, guild_id)

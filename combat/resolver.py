@@ -73,11 +73,11 @@ def resolve_combat(challenger: Combatant, target: Combatant) -> CombatResult:
     )
 
 
-def qi_steal_amount(loser_qi: int, challenger_won: bool, margin: int) -> int:
+def qi_steal_amount(loser_qi: int, margin: int) -> int:
     """
     Steal 10–25% of loser's Qi scaled by margin of victory (0–3 rounds won).
     margin = winning side's round wins (2 or 3 out of 3).
     """
-    pct = 0.10 + (margin - 2) * 0.075   # margin=2 → 10%, margin=3 → 17.5% (capped at 25%)
+    pct = 0.10 + (margin - 2) * 0.075   # margin=2 → 10%, margin=3 → 17.5%
     pct = min(pct, 0.25)
     return max(1, int(loser_qi * pct))

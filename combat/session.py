@@ -49,8 +49,8 @@ class RoundRecord:
     b_action:     str
     a_power:      float
     b_power:      float
-    a_effective:  float   # damage dealt TO b
-    b_effective:  float   # damage dealt TO a
+    a_effective:  float   # damage dealt TO b  (by a)
+    b_effective:  float   # damage dealt TO a  (by b)
     round_winner: str     # "a" | "b" | "tie"
     narrative:    str
 
@@ -234,6 +234,7 @@ class CombatSession:
                 self.b_wins += 1
 
             # Cosmetic HP drain
+            # a takes damage from b (b_effective = damage dealt by b = damage dealt TO a)
             self.a_hp = max(0.0, self.a_hp - record.b_effective * 0.8)
             self.b_hp = max(0.0, self.b_hp - record.a_effective * 0.8)
 
@@ -298,7 +299,8 @@ class CombatSession:
             round_num=round_num,
             a_action=a_action, b_action=b_action,
             a_power=a_power,   b_power=b_power,
-            a_effective=b_takes, b_effective=a_takes,
+            a_effective=b_takes,   # damage dealt TO b (by a)
+            b_effective=a_takes,   # damage dealt TO a (by b)
             round_winner=round_winner,
             narrative=narrative,
         )
@@ -337,13 +339,14 @@ class CombatSession:
     def _round_result_embed(self, record: RoundRecord, round_num: int) -> discord.Embed:
         icon = {"strike": "⚔️", "guard": "🛡️"}
 
+        # FIX: a_effective = damage dealt by a (to b); b_effective = damage dealt by b (to a)
         a_line = (
             f"{icon[record.a_action]} **{self.a_member.display_name}** — "
-            f"{record.a_action} · power `{record.a_power:.1f}` · dealt `{record.b_effective:.1f}`"
+            f"{record.a_action} · power `{record.a_power:.1f}` · dealt `{record.a_effective:.1f}`"
         )
         b_line = (
             f"{icon[record.b_action]} **{self.b_member.display_name}** — "
-            f"{record.b_action} · power `{record.b_power:.1f}` · dealt `{record.a_effective:.1f}`"
+            f"{record.b_action} · power `{record.b_power:.1f}` · dealt `{record.b_effective:.1f}`"
         )
 
         if record.round_winner == "a":

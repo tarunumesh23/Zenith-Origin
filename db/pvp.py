@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Literal
 
 from cultivation.constants import REALM_ORDER          # ← was: from db.cultivators import REALM_ORDER
 from db.database import execute, fetch_one, fetch_all
@@ -205,8 +206,8 @@ async def apply_stage_loss(discord_id: int, row: dict) -> dict | None:
         (new_realm, new_stage, new_threshold, discord_id),
     )
 
-    from db.database import fetch_one as _fetch_one
-    return await _fetch_one(
+    # FIX: use module-level fetch_one instead of re-importing locally
+    return await fetch_one(
         "SELECT * FROM cultivators WHERE discord_id = %s", (discord_id,)
     )
 

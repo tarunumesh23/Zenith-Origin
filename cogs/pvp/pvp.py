@@ -7,7 +7,10 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord.ext import commands
 
-from combat.resolver import Combatant, resolve_combat, qi_steal_amount
+from combat.resolver import (
+    Combatant, CombatResult, RoundResult, _roll_power,
+    resolve_combat, qi_steal_amount,
+)
 from combat.session import CombatSession, SessionResult
 from cultivation.constants import (
     AFFINITY_DISPLAY,
@@ -46,6 +49,7 @@ from db.pvp import (
     transfer_qi,
 )
 from ui.embed import build_embed, error_embed, warning_embed
+from ui.interaction_utils import safe_defer
 
 log = logging.getLogger("bot.cogs.pvp")
 
@@ -59,7 +63,7 @@ DUEL_COOLDOWN_DAYS       = 7
 AMBUSH_COOLDOWN_HOURS    = 48
 WARD_DURATION_HOURS      = 4
 
-SPAR_QI_REWARD = 5   # Qi awarded to the winner of a spar
+SPAR_QI_REWARD = 5
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +117,15 @@ class PvP(commands.Cog):
         self.bot = bot
 
     # -----------------------------------------------------------------------
-    # /spar — interactive, no stakes, small Qi reward for winner
+    # /spar
     # -----------------------------------------------------------------------
 
     @commands.hybrid_command(name="spar", description="Friendly spar — interactive fight, no stakes")
     @commands.cooldown(1, 30, commands.BucketType.user)
     async def spar(self, ctx: commands.Context, member: discord.Member) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction)
+
         if member.id == ctx.author.id:
             await ctx.send(embed=error_embed(ctx, "You cannot spar yourself."), ephemeral=True)
             return
@@ -130,7 +137,6 @@ class PvP(commands.Cog):
             await ctx.send(embed=error_embed(ctx, "Both cultivators must be registered."), ephemeral=True)
             return
 
-        # Announce the spar
         await ctx.send(
             embed=build_embed(
                 ctx,
@@ -139,7 +145,7 @@ class PvP(commands.Cog):
                     f"{ctx.author.mention} challenges {member.mention} to a **friendly spar**!\n\n"
                     f"No Qi loss · No reputation change · Winner gains `+{SPAR_QI_REWARD}` Qi\n\n"
                     f"*Choose your action each round using the buttons below.*\n"
-                    f"*{ACTION_TIMEOUT}s timeout per round — act fast!*"
+                    f"*{CombatSession.__module__ and 30}s timeout per round — act fast!*"
                 ),
                 color=discord.Color.blue(),
             )
@@ -152,7 +158,6 @@ class PvP(commands.Cog):
         winner_mem = ctx.author if winner_id == ctx.author.id else member
         loser_mem  = member if winner_id == ctx.author.id else ctx.author
 
-        # Award Qi to winner (no loss to anyone)
         from db.cultivators import add_qi
         await add_qi(winner_row["discord_id"], SPAR_QI_REWARD)
 
@@ -183,6 +188,9 @@ class PvP(commands.Cog):
     @commands.hybrid_command(name="challenge", description="Issue a formal Dao Challenge")
     @commands.cooldown(1, 30, commands.BucketType.user)
     async def challenge(self, ctx: commands.Context, member: discord.Member) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction)
+
         if member.id == ctx.author.id:
             await ctx.send(embed=error_embed(ctx, "You cannot challenge yourself."), ephemeral=True)
             return
@@ -237,6 +245,9 @@ class PvP(commands.Cog):
 
     @commands.hybrid_command(name="accept", description="Accept a pending Dao Challenge")
     async def accept(self, ctx: commands.Context) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction)
+
         pending = await get_incoming_challenge(ctx.author.id)
         if not pending:
             await ctx.send(embed=error_embed(ctx, "You have no pending challenges to accept."), ephemeral=True)
@@ -289,7 +300,7 @@ class PvP(commands.Cog):
         loser_mem  = ctx.author if winner_id == challenger_id else challenger_member
 
         margin = result.a_wins if winner_id == challenger_id else result.b_wins
-        steal  = qi_steal_amount(loser_row["qi"], winner_id == challenger_id, margin)
+        steal  = qi_steal_amount(loser_row["qi"], margin)
         await transfer_qi(winner_row["discord_id"], loser_row["discord_id"], steal)
 
         above = _above_realm(winner_row, loser_row)
@@ -334,6 +345,9 @@ class PvP(commands.Cog):
 
     @commands.hybrid_command(name="flee", description="Flee a pending Dao Challenge (costs reputation)")
     async def flee(self, ctx: commands.Context) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction)
+
         pending = await get_incoming_challenge(ctx.author.id)
         if not pending:
             await ctx.send(embed=error_embed(ctx, "You have no pending challenges to flee from."), ephemeral=True)
@@ -373,6 +387,9 @@ class PvP(commands.Cog):
     @commands.hybrid_command(name="duel", description="Issue a Life-and-Death Duel — loser loses a stage")
     @commands.cooldown(1, 30, commands.BucketType.user)
     async def duel(self, ctx: commands.Context, member: discord.Member) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction)
+
         if member.id == ctx.author.id:
             await ctx.send(embed=error_embed(ctx, "You cannot duel yourself."), ephemeral=True)
             return
@@ -434,6 +451,9 @@ class PvP(commands.Cog):
 
     @commands.hybrid_command(name="acceptduel", description="Accept a pending Life-and-Death Duel")
     async def acceptduel(self, ctx: commands.Context) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction)
+
         pending = await get_incoming_duel_request(ctx.author.id)
         if not pending:
             await ctx.send(embed=error_embed(ctx, "You have no pending duel requests."), ephemeral=True)
@@ -550,6 +570,9 @@ class PvP(commands.Cog):
     @commands.hybrid_command(name="ambush", description="Ambush a cultivator in closed cultivation")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def ambush(self, ctx: commands.Context, member: discord.Member) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction)
+
         if member.id == ctx.author.id:
             await ctx.send(embed=error_embed(ctx, "You cannot ambush yourself."), ephemeral=True)
             return
@@ -600,7 +623,6 @@ class PvP(commands.Cog):
         target     = _make_combatant(t_row)
 
         if warded:
-            from combat.resolver import _roll_power, RoundResult, CombatResult
             rounds = []
             c_wins = t_wins = 0
             for _ in range(3):
@@ -669,6 +691,9 @@ class PvP(commands.Cog):
     @commands.hybrid_command(name="ward", description="Set a Formation Ward to defend against ambushes")
     @commands.cooldown(1, 3600, commands.BucketType.user)
     async def ward(self, ctx: commands.Context) -> None:
+        if ctx.interaction:
+            await safe_defer(ctx.interaction, ephemeral=True)
+
         row = await get_cultivator(ctx.author.id)
         if not row:
             await ctx.send(embed=error_embed(ctx, "You are not registered."), ephemeral=True)
@@ -717,7 +742,3 @@ class PvP(commands.Cog):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(PvP(bot))
-
-
-# Expose constant for session import
-ACTION_TIMEOUT = 30

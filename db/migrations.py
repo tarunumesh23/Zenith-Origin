@@ -32,7 +32,7 @@ async def _migration_7(total: int) -> None:
           AND TABLE_NAME   = 'cultivators'
           AND COLUMN_NAME  = 'last_updated'
         """,
-        (),   # FIX #9: explicit empty args tuple
+        (),
     )
     if row and row["cnt"]:
         log.debug("Migration 7/%d SKIP — last_updated already exists", total)
@@ -48,7 +48,126 @@ async def _migration_7(total: int) -> None:
     log.debug("Migration 7/%d OK — last_updated column added", total)
 
 
+async def _migration_19(total: int) -> None:
+    """
+    Create spirit_roots table if it does not already exist.
+    Guarded so re-running migrations on an existing install is safe.
+    """
+    row = await fetch_one(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'spirit_roots'
+        """,
+        (),
+    )
+    if row and row["cnt"]:
+        log.debug("Migration 19/%d SKIP — spirit_roots already exists", total)
+        return
+
+    await execute(
+        """
+        CREATE TABLE spirit_roots (
+            discord_id      BIGINT UNSIGNED     NOT NULL,
+            guild_id        BIGINT UNSIGNED     NOT NULL,
+
+            current_value   TINYINT UNSIGNED    NOT NULL DEFAULT 1,
+            best_value      TINYINT UNSIGNED    NOT NULL DEFAULT 1,
+            pity_counter    SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
+            total_spins     INT UNSIGNED        NOT NULL DEFAULT 0,
+
+            acquired_at     DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_spin_at    DATETIME            DEFAULT NULL,
+
+            PRIMARY KEY (discord_id, guild_id),
+            FOREIGN KEY (discord_id)
+                REFERENCES cultivators(discord_id) ON DELETE CASCADE,
+
+            CONSTRAINT chk_sr_current CHECK (current_value BETWEEN 1 AND 5),
+            CONSTRAINT chk_sr_best    CHECK (best_value    BETWEEN 1 AND 5)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
+    )
+    log.debug("Migration 19/%d OK — spirit_roots table created", total)
+
+
+async def _migration_20(total: int) -> None:
+    """
+    Create spirit_root_spin_log table if it does not already exist.
+    """
+    row = await fetch_one(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'spirit_root_spin_log'
+        """,
+        (),
+    )
+    if row and row["cnt"]:
+        log.debug("Migration 20/%d SKIP — spirit_root_spin_log already exists", total)
+        return
+
+    await execute(
+        """
+        CREATE TABLE spirit_root_spin_log (
+            id              BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            discord_id      BIGINT UNSIGNED     NOT NULL,
+            guild_id        BIGINT UNSIGNED     NOT NULL,
+
+            rolled_value    TINYINT UNSIGNED    NOT NULL,
+            pity_triggered  BOOLEAN             NOT NULL DEFAULT FALSE,
+            outcome         ENUM('improved','equal','protected') NOT NULL,
+            spun_at         DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (discord_id)
+                REFERENCES cultivators(discord_id) ON DELETE CASCADE,
+
+            INDEX idx_spirit_log_player (discord_id, guild_id, spun_at)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
+    )
+    log.debug("Migration 20/%d OK — spirit_root_spin_log table created", total)
+
+
+async def _migration_21(total: int) -> None:
+    """
+    Fix breakthrough_log.outcome ENUM to match actual call sites.
+    Previous schema used ENUM('success','minor_fail','major_fail') but
+    all log_breakthrough() calls pass 'fail', which is not in that ENUM.
+    MySQL silently inserts '' in non-strict mode or raises an error in
+    strict mode.  This migration aligns the column with actual usage.
+    Guarded so it is safe to re-run on fresh installs.
+    """
+    row = await fetch_one(
+        """
+        SELECT COLUMN_TYPE
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME   = 'breakthrough_log'
+          AND COLUMN_NAME  = 'outcome'
+        """,
+        (),
+    )
+    if row and "minor_fail" not in (row.get("COLUMN_TYPE") or ""):
+        log.debug("Migration 21/%d SKIP — outcome ENUM already correct", total)
+        return
+
+    await execute(
+        """
+        ALTER TABLE breakthrough_log
+            MODIFY COLUMN outcome ENUM('success','fail') NOT NULL
+        """
+    )
+    log.debug("Migration 21/%d OK — breakthrough_log.outcome ENUM fixed", total)
+
+
 MIGRATIONS: list[str | object] = [
+    # =========================================================================
+    #  CORE CULTIVATOR TABLES  (migrations 1–10)
+    # =========================================================================
+
     # 1. Core cultivators table
     """
     CREATE TABLE IF NOT EXISTS cultivators (
@@ -91,13 +210,15 @@ MIGRATIONS: list[str | object] = [
     """,
 
     # 2. Breakthrough history log
+    # FIX: outcome ENUM corrected from ('success','minor_fail','major_fail')
+    #      to ('success','fail') to match log_breakthrough() call sites.
     """
     CREATE TABLE IF NOT EXISTS breakthrough_log (
         id              BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
         discord_id      BIGINT UNSIGNED     NOT NULL,
         realm           VARCHAR(30)         NOT NULL,
         stage           TINYINT UNSIGNED    NOT NULL,
-        outcome         ENUM('success','minor_fail','major_fail') NOT NULL,
+        outcome         ENUM('success','fail') NOT NULL,
         qi_lost         INT UNSIGNED        NOT NULL DEFAULT 0,
         overflow        BOOLEAN             NOT NULL DEFAULT FALSE,
         attempted_at    DATETIME            NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -178,15 +299,16 @@ MIGRATIONS: list[str | object] = [
        OR last_updated IS NULL
     """,
 
-    # 10. FIX #10: removed the unconditional Water→NULL wipe that would
-    #     destroy legitimate Water affinity choices.  If you still need to
-    #     reset the old hardcoded default, add a date guard here, e.g.:
+    # 10. Intentional no-op — see comment below.
+    #
+    # Previously contained an unconditional Water→NULL wipe that would
+    # destroy legitimate Water affinity choices.  Removed.  If you need
+    # to reset the old hardcoded default, add a date-guarded UPDATE here:
     #
     #   UPDATE cultivators SET affinity = NULL
     #   WHERE affinity = 'water'
     #     AND registered_at < '<date you deployed affinity choice>'
     #
-    # This migration is intentionally a no-op so the numbering stays stable.
     "SELECT 1  /* migration 10 — intentional no-op, see comment above */",
 
     # =========================================================================
@@ -332,6 +454,27 @@ MIGRATIONS: list[str | object] = [
         FOREIGN KEY (discord_id) REFERENCES cultivators(discord_id) ON DELETE CASCADE
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
+
+    # =========================================================================
+    #  SPIRIT ROOT SYSTEM TABLES  (migrations 19–20)
+    # =========================================================================
+
+    # 19. Spirit roots — one row per (player, guild).
+    #     Guarded callable: safe to run on installs that already have the table.
+    _migration_19,
+
+    # 20. Spirit root spin audit log — immutable.
+    #     Guarded callable: safe to run on installs that already have the table.
+    _migration_20,
+
+    # =========================================================================
+    #  BUG FIXES  (migration 21)
+    # =========================================================================
+
+    # 21. Fix breakthrough_log.outcome ENUM mismatch.
+    #     Previous schema had ENUM('success','minor_fail','major_fail') but all
+    #     log_breakthrough() call sites pass 'fail'.  Guarded callable.
+    _migration_21,
 ]
 
 

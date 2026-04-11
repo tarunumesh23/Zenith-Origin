@@ -26,11 +26,11 @@ from talent.cultivation_bridge import describe_bonuses
 from talent.models import PlayerTalent, PlayerTalentData
 from db import talent as db
 from ui.embed import build_embed, error_embed
+from ui.interaction_utils import safe_defer, safe_edit
 
 log = logging.getLogger("bot.cogs.talent")
 
 INVENTORY_MAX = 20
-# Maximum tokens a player can gift to another in one call
 GIFT_MAX = 5
 
 
@@ -47,7 +47,6 @@ def _rarity_color(rarity: str) -> discord.Color:
 
 
 def _enrich_talent(talent: PlayerTalent) -> PlayerTalent:
-    """Fill in color and emoji from RARITIES if the talent was loaded from DB."""
     rarity_data   = RARITIES.get(talent.rarity, {})
     talent.color  = rarity_data.get("color", 0xFFFFFF)
     talent.emoji  = rarity_data.get("emoji", "")
@@ -55,7 +54,6 @@ def _enrich_talent(talent: PlayerTalent) -> PlayerTalent:
 
 
 async def _guard_cultivator(ctx: commands.Context) -> dict | None:
-    """Ensure the user is a registered cultivator."""
     try:
         from db import cultivators as cult_db
         row = await cult_db.get_cultivator(ctx.author.id)
@@ -144,14 +142,11 @@ class Talent(commands.Cog):
 
     # ── /talent ───────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="talent",
-        description="View your active talent",
-    )
+    @commands.hybrid_command(name="talent", description="View your active talent")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def talent(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -188,14 +183,11 @@ class Talent(commands.Cog):
 
     # ── /inventory ────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="inventory",
-        description="Browse your talent inventory",
-    )
+    @commands.hybrid_command(name="inventory", description="Browse your talent inventory")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def inventory(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -240,10 +232,7 @@ class Talent(commands.Cog):
 
     # ── /fuse ─────────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="fuse",
-        description="Fuse two talents from your inventory",
-    )
+    @commands.hybrid_command(name="fuse", description="Fuse two talents from your inventory")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def fuse(
         self,
@@ -252,13 +241,8 @@ class Talent(commands.Cog):
         slot_b: int,
         mode: str = "auto",
     ) -> None:
-        """
-        Fuse the talent in slot_a with slot_b.
-        mode: auto | same | cross | rng
-        Slots are 1-indexed as shown in /inventory.
-        """
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -307,7 +291,6 @@ class Talent(commands.Cog):
 
         result = fuse_talents(player, talent_a, talent_b, mode=mode)
 
-        # Remove consumed talents (higher index first to avoid index shifting)
         for idx in sorted([slot_a - 1, slot_b - 1], reverse=True):
             player.inventory.pop(idx)
 
@@ -401,19 +384,11 @@ class Talent(commands.Cog):
 
     # ── /evolve ───────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="evolve",
-        description="Evolve a talent in your inventory",
-    )
+    @commands.hybrid_command(name="evolve", description="Evolve a talent in your inventory")
     @commands.cooldown(1, 5, commands.BucketType.user)
-    async def evolve(
-        self,
-        ctx: commands.Context,
-        slot: int,
-        crystals: int = 0,
-    ) -> None:
+    async def evolve(self, ctx: commands.Context, slot: int, crystals: int = 0) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -449,14 +424,11 @@ class Talent(commands.Cog):
 
     # ── /lock ─────────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="lock",
-        description="Toggle lock on a talent in your inventory",
-    )
+    @commands.hybrid_command(name="lock", description="Toggle lock on a talent in your inventory")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def lock(self, ctx: commands.Context, slot: int) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -493,14 +465,11 @@ class Talent(commands.Cog):
 
     # ── /set_active ───────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="set_active",
-        description="Swap a talent from your inventory into your active slot",
-    )
+    @commands.hybrid_command(name="set_active", description="Swap a talent from your inventory into your active slot")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def set_active(self, ctx: commands.Context, slot: int) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -519,8 +488,6 @@ class Talent(commands.Cog):
             return
 
         chosen = inv[slot - 1]
-
-        # Remove from inventory BEFORE accept_talent to avoid duplication
         player.inventory = [t for t in player.inventory if t is not chosen]
         msg = accept_talent(player, chosen, replace_active=True)
 
@@ -533,14 +500,11 @@ class Talent(commands.Cog):
 
     # ── /tokens ───────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="tokens",
-        description="Check how many spin tokens you have",
-    )
+    @commands.hybrid_command(name="tokens", description="Check how many spin tokens you have")
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def tokens(self, ctx: commands.Context) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -565,24 +529,11 @@ class Talent(commands.Cog):
 
     # ── /gift_spin ────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="gift_spin",
-        description="Gift spin token(s) from your balance to another cultivator",
-    )
+    @commands.hybrid_command(name="gift_spin", description="Gift spin token(s) from your balance to another cultivator")
     @commands.cooldown(1, 30, commands.BucketType.user)
-    async def gift_spin(
-        self,
-        ctx: commands.Context,
-        member: discord.Member,
-        amount: int = 1,
-    ) -> None:
-        """
-        Transfer 1–GIFT_MAX spin tokens from yourself to another registered cultivator.
-        Cannot gift to yourself or bots.
-        30-second cooldown to prevent spam-gifting.
-        """
+    async def gift_spin(self, ctx: commands.Context, member: discord.Member, amount: int = 1) -> None:
         if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
+            await safe_defer(ctx.interaction, ephemeral=True)
 
         if member.id == ctx.author.id:
             await ctx.send(
@@ -614,7 +565,6 @@ class Talent(commands.Cog):
 
         guild_id = ctx.guild.id if ctx.guild else 0
 
-        # Verify recipient is a cultivator
         try:
             from db import cultivators as cult_db
             target_row = await cult_db.get_cultivator(member.id)
@@ -649,8 +599,6 @@ class Talent(commands.Cog):
             )
             return
 
-        # Deduct then add — no atomic DB transaction assumed, but order matters:
-        # deduct first so a crash doesn't duplicate tokens.
         await db.consume_spin_token(ctx.author.id, guild_id, count=amount)
         await db.add_spin_tokens(member.id, guild_id, amount)
 
@@ -671,26 +619,16 @@ class Talent(commands.Cog):
                 color=discord.Color.green(),
                 show_footer=True,
             ),
-            ephemeral=False,  # public so recipient sees the notification
+            ephemeral=False,
         )
 
     # ── /use_spin ─────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(
-        name="use_spin",
-        description="Open a spin session — use as many tokens as you want in one go",
-    )
+    @commands.hybrid_command(name="use_spin", description="Open a spin session — use as many tokens as you want in one go")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def use_spin(self, ctx: commands.Context) -> None:
-        """
-        Opens a multi-spin session.  Each roll consumes one token.
-        After each roll four buttons appear:
-          ✅ Accept & Spin Again | ✅ Accept & Stop
-          ❌ Discard & Spin Again | ❌ Discard & Stop
-        "Spin Again" buttons are disabled when tokens run out or inventory is full.
-        """
         if ctx.interaction:
-            await ctx.interaction.response.defer()
+            await safe_defer(ctx.interaction)
 
         row = await _guard_cultivator(ctx)
         if row is None:
@@ -741,10 +679,6 @@ async def _do_spin(
     tokens: int,
     message: Optional[discord.Message],
 ) -> None:
-    """
-    Execute one spin roll, consume the token, then edit/send the message
-    with a _SpinSessionView so the player can immediately roll again.
-    """
     claimed                = await db.get_claimed_one_per_server(guild_id)
     talent, pity_triggered = spin_talent(player, claimed)
 
@@ -779,17 +713,6 @@ async def _do_spin(
 # ---------------------------------------------------------------------------
 
 class _SpinSessionView(discord.ui.View):
-    """
-    Displayed after every spin roll.
-
-    Four buttons across two rows:
-      Row 0: ✅ Accept & Spin Again | ✅ Accept & Stop
-      Row 1: ❌ Discard & Spin Again | ❌ Discard & Stop
-
-    "Spin Again" variants are disabled when the player has no tokens left
-    or their inventory is at capacity.
-    """
-
     def __init__(
         self,
         ctx: commands.Context,
@@ -851,7 +774,8 @@ class _SpinSessionView(discord.ui.View):
     ) -> None:
         self.stop()
         msg = await self._do_accept(interaction)
-        await interaction.response.edit_message(
+        await safe_edit(
+            interaction,
             embed=build_embed(
                 interaction,  # type: ignore[arg-type]
                 title="✅ Talent Accepted",
@@ -880,7 +804,8 @@ class _SpinSessionView(discord.ui.View):
     ) -> None:
         self.stop()
         msg = reject_talent(self.talent)
-        await interaction.response.edit_message(
+        await safe_edit(
+            interaction,
             embed=build_embed(
                 interaction,  # type: ignore[arg-type]
                 title="❌ Talent Discarded",

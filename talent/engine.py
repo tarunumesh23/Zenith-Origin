@@ -294,6 +294,7 @@ def fuse_talents(
     if success:
         player_data.fusion_pity = 0
 
+        # FIX: removed duplicate `result_talent: Optional[PlayerTalent] = None` annotation
         result_talent: Optional[PlayerTalent] = None
 
         if resolved_mode == "same":
@@ -352,7 +353,10 @@ def fuse_talents(
         player_data.fusion_pity = pity + 1
         failure = _resolve_failure(pity)
 
-        result_talent: Optional[PlayerTalent] = None
+        # FIX: no type annotation here — annotation already declared in the success branch
+        # above at function scope; re-annotating in the else branch causes SyntaxWarning
+        # in Python 3.12+.
+        result_talent = None
 
         if failure["outcome"] == "corruption":
             # BUFFED: corruption now produces exclusive corruption roots

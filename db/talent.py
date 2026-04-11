@@ -1,3 +1,18 @@
+"""
+db/talent.py
+~~~~~~~~~~~~
+All MySQL queries for the Talent system.
+
+Changes in this revision
+────────────────────────
+• Fixed all ``ON DUPLICATE KEY UPDATE ... VALUES(col)`` deprecation warnings.
+  MySQL 8.0.20+ deprecates the ``VALUES()`` function inside ODKU clauses.
+  All queries now use the row alias pattern:
+      INSERT INTO t (...) VALUES (...) AS new_row
+      ON DUPLICATE KEY UPDATE col = new_row.col
+• ``consume_spin_token`` retains the ``count`` keyword argument (fixes the
+  AdminTalent.revoke_spin TypeError from the original single-arg version).
+"""
 from __future__ import annotations
 
 import json
@@ -54,6 +69,7 @@ async def upsert_player_talent(
     now       = _now_naive()
     tags_json = json.dumps(tags or [])
 
+    # FIX: replaced deprecated VALUES(col) with row alias pattern
     await execute(
         """
         INSERT INTO player_talents
@@ -62,16 +78,17 @@ async def upsert_player_talent(
              tags, acquired_at, last_updated)
         VALUES
             (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        AS new_row
         ON DUPLICATE KEY UPDATE
-            guild_id          = VALUES(guild_id),
-            talent_name       = VALUES(talent_name),
-            talent_rarity     = VALUES(talent_rarity),
-            talent_multiplier = VALUES(talent_multiplier),
-            evolution_stage   = VALUES(evolution_stage),
-            is_corrupted      = VALUES(is_corrupted),
-            is_locked         = VALUES(is_locked),
-            tags              = VALUES(tags),
-            last_updated      = VALUES(last_updated)
+            guild_id          = new_row.guild_id,
+            talent_name       = new_row.talent_name,
+            talent_rarity     = new_row.talent_rarity,
+            talent_multiplier = new_row.talent_multiplier,
+            evolution_stage   = new_row.evolution_stage,
+            is_corrupted      = new_row.is_corrupted,
+            is_locked         = new_row.is_locked,
+            tags              = new_row.tags,
+            last_updated      = new_row.last_updated
         """,
         (
             discord_id, guild_id, talent_name, talent_rarity,
@@ -236,17 +253,19 @@ async def upsert_spin_pity(
     pity_mythical: int,
     total_spins: int,
 ) -> None:
+    # FIX: replaced deprecated VALUES(col) with row alias pattern
     await execute(
         """
         INSERT INTO talent_spin_pity
             (discord_id, pity_elite, pity_heavenly, pity_mythical, total_spins)
         VALUES
             (%s, %s, %s, %s, %s)
+        AS new_row
         ON DUPLICATE KEY UPDATE
-            pity_elite    = VALUES(pity_elite),
-            pity_heavenly = VALUES(pity_heavenly),
-            pity_mythical = VALUES(pity_mythical),
-            total_spins   = VALUES(total_spins)
+            pity_elite    = new_row.pity_elite,
+            pity_heavenly = new_row.pity_heavenly,
+            pity_mythical = new_row.pity_mythical,
+            total_spins   = new_row.total_spins
         """,
         (discord_id, pity_elite, pity_heavenly, pity_mythical, total_spins),
     )
@@ -268,15 +287,17 @@ async def upsert_fusion_pity(
     fusion_pity: int,
     total_fusions: int,
 ) -> None:
+    # FIX: replaced deprecated VALUES(col) with row alias pattern
     await execute(
         """
         INSERT INTO talent_fusion_pity
             (discord_id, fusion_pity, total_fusions)
         VALUES
             (%s, %s, %s)
+        AS new_row
         ON DUPLICATE KEY UPDATE
-            fusion_pity   = VALUES(fusion_pity),
-            total_fusions = VALUES(total_fusions)
+            fusion_pity   = new_row.fusion_pity,
+            total_fusions = new_row.total_fusions
         """,
         (discord_id, fusion_pity, total_fusions),
     )
@@ -295,24 +316,38 @@ async def get_spin_tokens(discord_id: int, guild_id: int) -> int:
 
 
 async def add_spin_tokens(discord_id: int, guild_id: int, amount: int) -> None:
+    # FIX: replaced deprecated VALUES(col) with row alias pattern
     await execute(
         """
         INSERT INTO spin_tokens (discord_id, guild_id, tokens)
         VALUES (%s, %s, %s)
-        ON DUPLICATE KEY UPDATE tokens = tokens + VALUES(tokens)
+        AS new_row
+        ON DUPLICATE KEY UPDATE tokens = tokens + new_row.tokens
         """,
         (discord_id, guild_id, amount),
     )
 
 
-async def consume_spin_token(discord_id: int, guild_id: int) -> None:
+async def consume_spin_token(
+    discord_id: int,
+    guild_id: int,
+    *,
+    count: int = 1,
+) -> None:
+    """
+    Deduct ``count`` spin tokens from the player's balance (floor: 0).
+
+    ``count`` is keyword-only to prevent accidental positional misuse.
+    """
+    if count < 1:
+        return
     await execute(
         """
         UPDATE spin_tokens
-        SET tokens = GREATEST(tokens - 1, 0)
+        SET tokens = GREATEST(tokens - %s, 0)
         WHERE discord_id = %s AND guild_id = %s
         """,
-        (discord_id, guild_id),
+        (count, discord_id, guild_id),
     )
 
 
@@ -323,7 +358,7 @@ async def consume_spin_token(discord_id: int, guild_id: int) -> None:
 async def log_spin(
     discord_id: int,
     guild_id: int,
-    talent_name: str,       # FIX #1: plain string, not PlayerTalent
+    talent_name: str,
     talent_rarity: str,
     pity_triggered: bool,
     accepted: bool,
@@ -359,9 +394,9 @@ async def mark_last_spin_accepted(discord_id: int, guild_id: int) -> None:
 async def log_fusion(
     discord_id: int,
     guild_id: int,
-    talent_a: str,          # FIX #2: plain string, not PlayerTalent
+    talent_a: str,
     talent_b: str,
-    mode: str,              # FIX #12: resolved_mode passed from cog ("same"/"cross"/"rng")
+    mode: str,
     success: bool,
     result_name: str | None,
     failure_outcome: str | None,
@@ -393,7 +428,6 @@ async def get_claimed_server_talents(guild_id: int) -> list[str]:
     return [r["talent_name"] for r in rows]
 
 
-# Alias used by cogs/talent.py
 async def get_claimed_one_per_server(guild_id: int) -> list[str]:
     return await get_claimed_server_talents(guild_id)
 
@@ -419,12 +453,7 @@ async def claim_server_talent(
     return rows_affected > 0
 
 
-# Alias used by cogs/talent.py
-async def claim_one_per_server(
-    guild_id: int,
-    discord_id: int,
-    talent_name: str,
-) -> bool:
+async def claim_one_per_server(guild_id: int, discord_id: int, talent_name: str) -> bool:
     return await claim_server_talent(guild_id, discord_id, talent_name)
 
 
@@ -446,15 +475,14 @@ from talent.models import PlayerTalent, PlayerTalentData  # noqa: E402
 
 
 def _row_to_player_talent(row: dict) -> PlayerTalent:
-    """Hydrate a db row dict into a PlayerTalent dataclass."""
     return PlayerTalent(
         name=row["talent_name"],
         base_name=row.get("base_name") or row["talent_name"],
         rarity=row["talent_rarity"],
         description=row.get("description", ""),
         multiplier=float(row["talent_multiplier"]),
-        color=0xFFFFFF,   # color is derived from rarity at display time
-        emoji="",         # emoji is derived from rarity at display time
+        color=0xFFFFFF,
+        emoji="",
         evolution_stage=int(row.get("evolution_stage", 0)),
         is_corrupted=bool(row.get("is_corrupted", False)),
         is_locked=bool(row.get("is_locked", False)),
@@ -466,10 +494,6 @@ async def get_player_talent_data(
     discord_id: int,
     guild_id: int,
 ) -> PlayerTalentData | None:
-    """
-    Load a player's full talent state from the DB.
-    Returns None if the player has no talent records at all.
-    """
     active_row = await get_player_talent(discord_id)
     inv_rows   = await get_inventory(discord_id)
     pity_row   = await get_spin_pity(discord_id)
@@ -501,16 +525,9 @@ async def get_player_talent_data(
 
 
 async def save_player_talent_data(player: PlayerTalentData) -> None:
-    """
-    Persist a player's full talent state to the DB.
-
-    Inventory is a full replace (delete-all + re-insert) which is safe
-    for the capped inventory size of 20.
-    """
     did = player.user_id
     gid = player.guild_id
 
-    # ── active talent ─────────────────────────────────────────
     if player.active_talent:
         t = player.active_talent
         await upsert_player_talent(
@@ -525,7 +542,6 @@ async def save_player_talent_data(player: PlayerTalentData) -> None:
             tags=t.tags,
         )
 
-    # ── inventory: full replace ───────────────────────────────
     await execute(
         "DELETE FROM talent_inventory WHERE discord_id = %s",
         (did,),
@@ -543,7 +559,6 @@ async def save_player_talent_data(player: PlayerTalentData) -> None:
             tags=t.tags,
         )
 
-    # ── pity counters ─────────────────────────────────────────
     await upsert_spin_pity(
         discord_id=did,
         pity_elite=player.spin_pity.get("Elite", 0),
@@ -564,10 +579,15 @@ async def save_player_talent_data(player: PlayerTalentData) -> None:
 
 async def reset_player_talent_data(discord_id: int, guild_id: int) -> None:
     """Wipe every talent record for a player."""
-    await execute("DELETE FROM player_talents    WHERE discord_id = %s", (discord_id,))
-    await execute("DELETE FROM talent_inventory  WHERE discord_id = %s", (discord_id,))
-    await execute("DELETE FROM talent_spin_pity  WHERE discord_id = %s", (discord_id,))
+    await execute("DELETE FROM player_talents     WHERE discord_id = %s", (discord_id,))
+    await execute("DELETE FROM talent_inventory   WHERE discord_id = %s", (discord_id,))
+    await execute("DELETE FROM talent_spin_pity   WHERE discord_id = %s", (discord_id,))
     await execute("DELETE FROM talent_fusion_pity WHERE discord_id = %s", (discord_id,))
-    await execute("DELETE FROM spin_tokens        WHERE discord_id = %s AND guild_id = %s",
-                  (discord_id, guild_id))
-    log.info("Talents » reset all talent data discord_id=%s guild_id=%s", discord_id, guild_id)
+    await execute(
+        "DELETE FROM spin_tokens WHERE discord_id = %s AND guild_id = %s",
+        (discord_id, guild_id),
+    )
+    log.info(
+        "Talents » reset all talent data discord_id=%s guild_id=%s",
+        discord_id, guild_id,
+    )

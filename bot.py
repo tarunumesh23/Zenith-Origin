@@ -70,9 +70,24 @@ _start_time: float | None = None
 # ---------------------------------------------------------------------------
 @bot.check
 async def global_check(ctx: commands.Context) -> bool:
+    global BOT_LOCKED, LOCK_REASON
+    BOT_LOCKED = False
+    LOCK_REASON = "No reason provided."
+
     # Owner bypasses everything
     if ctx.author.id == OWNER_ID:
         return True
+
+    # 🔒 Bot lock check
+    if BOT_LOCKED:
+        await ctx.send(
+            embed=discord.Embed(
+                title="🔒 Bot Locked",
+                description=f"The bot is currently locked by the owner.\n\n**Reason:** {LOCK_REASON}",
+                color=discord.Color.red(),
+            )
+        )
+        return False
 
     # Role gate
     if REQUIRE_ROLE and not any(role.id == REQUIRED_ROLE_ID for role in ctx.author.roles):
@@ -219,6 +234,42 @@ async def sync(ctx):
     bot.tree.clear_commands(guild=None)
     await bot.tree.sync()
     await ctx.send("Synced and cleared global commands.")
+
+
+
+@bot.command()
+@commands.is_owner()
+async def lock(ctx, *, reason: str = "No reason provided."):
+    global BOT_LOCKED, LOCK_REASON
+
+    BOT_LOCKED = True
+    LOCK_REASON = reason
+
+    await ctx.send(
+        embed=discord.Embed(
+            title="🔒 Bot Locked",
+            description=f"Bot has been locked.\n\n**Reason:** {reason}",
+            color=discord.Color.red(),
+        )
+    )
+
+
+@bot.command()
+@commands.is_owner()
+async def unlock(ctx):
+    global BOT_LOCKED, LOCK_REASON
+
+    BOT_LOCKED = False
+    LOCK_REASON = ""
+
+    await ctx.send(
+        embed=discord.Embed(
+            title="🔓 Bot Unlocked",
+            description="Bot is now operational again.",
+            color=discord.Color.green(),
+        )
+    )
+
 
 # ---------------------------------------------------------------------------
 # Entry point

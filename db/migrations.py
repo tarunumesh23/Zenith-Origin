@@ -132,14 +132,6 @@ async def _migration_20(total: int) -> None:
 
 
 async def _migration_21(total: int) -> None:
-    """
-    Fix breakthrough_log.outcome ENUM to match actual call sites.
-    Previous schema used ENUM('success','minor_fail','major_fail') but
-    all log_breakthrough() calls pass 'fail', which is not in that ENUM.
-    MySQL silently inserts '' in non-strict mode or raises an error in
-    strict mode.  This migration aligns the column with actual usage.
-    Guarded so it is safe to re-run on fresh installs.
-    """
     row = await fetch_one(
         """
         SELECT COLUMN_TYPE
@@ -150,16 +142,28 @@ async def _migration_21(total: int) -> None:
         """,
         (),
     )
+
     if row and "minor_fail" not in (row.get("COLUMN_TYPE") or ""):
         log.debug("Migration 21/%d SKIP — outcome ENUM already correct", total)
         return
 
+    # ✅ STEP 1: Normalize old values BEFORE altering ENUM
+    await execute(
+        """
+        UPDATE breakthrough_log
+        SET outcome = 'fail'
+        WHERE outcome IN ('minor_fail', 'major_fail')
+        """
+    )
+
+    # ✅ STEP 2: Now safely shrink ENUM
     await execute(
         """
         ALTER TABLE breakthrough_log
-            MODIFY COLUMN outcome ENUM('success','fail') NOT NULL
+        MODIFY COLUMN outcome ENUM('success','fail') NOT NULL
         """
     )
+
     log.debug("Migration 21/%d OK — breakthrough_log.outcome ENUM fixed", total)
 
 

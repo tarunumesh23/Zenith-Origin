@@ -7,22 +7,11 @@ from db.database import connect, disconnect, execute, fetch_one
 
 log = logging.getLogger("bot.migrations")
 
-# ---------------------------------------------------------------------------
-# Migration list
-# Each entry is either:
-#   - a plain SQL string  → executed directly
-#   - a callable          → async def(total: int) -> None
-#
-# Callables are used for migrations that need conditional logic because
-# MySQL does not support ADD COLUMN IF NOT EXISTS (MariaDB-only syntax).
-# ---------------------------------------------------------------------------
-
 
 async def _migration_7(total: int) -> None:
     """
     Add last_updated column for installs that ran migrations 1-6 before
     this column was introduced.
-    FIX #9: pass an explicit empty tuple for args instead of None.
     """
     row = await fetch_one(
         """
@@ -51,7 +40,6 @@ async def _migration_7(total: int) -> None:
 async def _migration_19(total: int) -> None:
     """
     Create spirit_roots table if it does not already exist.
-    Guarded so re-running migrations on an existing install is safe.
     """
     row = await fetch_one(
         """
@@ -132,6 +120,12 @@ async def _migration_20(total: int) -> None:
 
 
 async def _migration_21(total: int) -> None:
+    """
+    Fix breakthrough_log.outcome ENUM — remove old 'minor_fail'/'major_fail'
+    values and normalise everything to 'success'/'fail'.
+
+    Skip if the column is already clean (no 'minor_fail' in the ENUM definition).
+    """
     row = await fetch_one(
         """
         SELECT COLUMN_TYPE
@@ -143,11 +137,19 @@ async def _migration_21(total: int) -> None:
         (),
     )
 
-    if row and "minor_fail" not in (row.get("COLUMN_TYPE") or ""):
-        log.debug("Migration 21/%d SKIP — outcome ENUM already correct", total)
+    if row is None:
+        # Table doesn't exist yet — nothing to fix
+        log.debug("Migration 21/%d SKIP — breakthrough_log not found", total)
         return
 
-    # ✅ STEP 1: Normalize old values BEFORE altering ENUM
+    column_type = (row.get("COLUMN_TYPE") or "").lower()
+
+    # Only run if the old values are still present in the ENUM definition
+    if "minor_fail" not in column_type and "major_fail" not in column_type:
+        log.debug("Migration 21/%d SKIP — outcome ENUM already clean", total)
+        return
+
+    # Step 1: normalise any rows that still carry the old values
     await execute(
         """
         UPDATE breakthrough_log
@@ -156,7 +158,7 @@ async def _migration_21(total: int) -> None:
         """
     )
 
-    # ✅ STEP 2: Now safely shrink ENUM
+    # Step 2: shrink the ENUM now that no rows use the old values
     await execute(
         """
         ALTER TABLE breakthrough_log
@@ -165,6 +167,41 @@ async def _migration_21(total: int) -> None:
     )
 
     log.debug("Migration 21/%d OK — breakthrough_log.outcome ENUM fixed", total)
+
+
+async def _migration_22(total: int) -> None:
+    """
+    Ensure player_talents has a Cosmic rarity option.
+    Some installs were created before Cosmic was added to the ENUM.
+    Also covers talent_inventory and talent_spin_log.
+    """
+    for table in ("player_talents", "talent_inventory", "talent_spin_log"):
+        row = await fetch_one(
+            """
+            SELECT COLUMN_TYPE
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME   = %s
+              AND COLUMN_NAME  = 'talent_rarity'
+            """,
+            (table,),
+        )
+        if row is None:
+            continue
+        column_type = (row.get("COLUMN_TYPE") or "").lower()
+        if "cosmic" in column_type:
+            log.debug("Migration 22/%d SKIP — %s.talent_rarity already has Cosmic", total, table)
+            continue
+
+        await execute(
+            f"""
+            ALTER TABLE {table}
+            MODIFY COLUMN talent_rarity
+                ENUM('Trash','Common','Rare','Elite','Heavenly','Mythical','Divine','Cosmic')
+                NOT NULL
+            """
+        )
+        log.debug("Migration 22/%d OK — added Cosmic to %s.talent_rarity", total, table)
 
 
 MIGRATIONS: list[str | object] = [
@@ -214,8 +251,6 @@ MIGRATIONS: list[str | object] = [
     """,
 
     # 2. Breakthrough history log
-    # FIX: outcome ENUM corrected from ('success','minor_fail','major_fail')
-    #      to ('success','fail') to match log_breakthrough() call sites.
     """
     CREATE TABLE IF NOT EXISTS breakthrough_log (
         id              BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -303,23 +338,14 @@ MIGRATIONS: list[str | object] = [
        OR last_updated IS NULL
     """,
 
-    # 10. Intentional no-op — see comment below.
-    #
-    # Previously contained an unconditional Water→NULL wipe that would
-    # destroy legitimate Water affinity choices.  Removed.  If you need
-    # to reset the old hardcoded default, add a date-guarded UPDATE here:
-    #
-    #   UPDATE cultivators SET affinity = NULL
-    #   WHERE affinity = 'water'
-    #     AND registered_at < '<date you deployed affinity choice>'
-    #
-    "SELECT 1  /* migration 10 — intentional no-op, see comment above */",
+    # 10. Intentional no-op.
+    "SELECT 1  /* migration 10 — intentional no-op */",
 
     # =========================================================================
     #  TALENT SYSTEM TABLES  (migrations 11–18)
     # =========================================================================
 
-    # 11. Active talent per player (one row per player)
+    # 11. Active talent per player
     """
     CREATE TABLE IF NOT EXISTS player_talents (
         discord_id        BIGINT UNSIGNED     NOT NULL PRIMARY KEY,
@@ -328,7 +354,7 @@ MIGRATIONS: list[str | object] = [
         talent_name       VARCHAR(100)        NOT NULL,
         talent_rarity     ENUM(
                             'Trash','Common','Rare','Elite',
-                            'Heavenly','Mythical','Divine'
+                            'Heavenly','Mythical','Divine','Cosmic'
                           )                   NOT NULL,
         talent_multiplier FLOAT               NOT NULL DEFAULT 1.0,
         evolution_stage   TINYINT UNSIGNED    NOT NULL DEFAULT 0,
@@ -344,7 +370,7 @@ MIGRATIONS: list[str | object] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 12. Talent inventory (multiple talents per player)
+    # 12. Talent inventory
     """
     CREATE TABLE IF NOT EXISTS talent_inventory (
         id                BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -354,7 +380,7 @@ MIGRATIONS: list[str | object] = [
         talent_name       VARCHAR(100)        NOT NULL,
         talent_rarity     ENUM(
                             'Trash','Common','Rare','Elite',
-                            'Heavenly','Mythical','Divine'
+                            'Heavenly','Mythical','Divine','Cosmic'
                           )                   NOT NULL,
         talent_multiplier FLOAT               NOT NULL DEFAULT 1.0,
         evolution_stage   TINYINT UNSIGNED    NOT NULL DEFAULT 0,
@@ -369,7 +395,7 @@ MIGRATIONS: list[str | object] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 13. Spin pity counters — FIX #11: added guild_id for per-server pity
+    # 13. Spin pity counters
     """
     CREATE TABLE IF NOT EXISTS talent_spin_pity (
         discord_id        BIGINT UNSIGNED     NOT NULL,
@@ -384,7 +410,7 @@ MIGRATIONS: list[str | object] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 14. Fusion pity counters — FIX #11: added guild_id for per-server pity
+    # 14. Fusion pity counters
     """
     CREATE TABLE IF NOT EXISTS talent_fusion_pity (
         discord_id        BIGINT UNSIGNED     NOT NULL,
@@ -397,7 +423,7 @@ MIGRATIONS: list[str | object] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 15. Immutable spin audit log
+    # 15. Spin audit log
     """
     CREATE TABLE IF NOT EXISTS talent_spin_log (
         id                BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -406,7 +432,7 @@ MIGRATIONS: list[str | object] = [
         talent_name       VARCHAR(100)        NOT NULL,
         talent_rarity     ENUM(
                             'Trash','Common','Rare','Elite',
-                            'Heavenly','Mythical','Divine'
+                            'Heavenly','Mythical','Divine','Cosmic'
                           )                   NOT NULL,
         pity_triggered    BOOLEAN             NOT NULL DEFAULT FALSE,
         accepted          BOOLEAN             NOT NULL DEFAULT FALSE,
@@ -416,7 +442,7 @@ MIGRATIONS: list[str | object] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 16. Immutable fusion audit log — FIX #12: added 'auto' to mode ENUM
+    # 16. Fusion audit log
     """
     CREATE TABLE IF NOT EXISTS talent_fusion_log (
         id                BIGINT UNSIGNED     NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -447,7 +473,7 @@ MIGRATIONS: list[str | object] = [
     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     """,
 
-    # 18. FIX #13: spin tokens table (was entirely missing from schema)
+    # 18. Spin tokens table
     """
     CREATE TABLE IF NOT EXISTS spin_tokens (
         discord_id        BIGINT UNSIGNED     NOT NULL,
@@ -463,22 +489,18 @@ MIGRATIONS: list[str | object] = [
     #  SPIRIT ROOT SYSTEM TABLES  (migrations 19–20)
     # =========================================================================
 
-    # 19. Spirit roots — one row per (player, guild).
-    #     Guarded callable: safe to run on installs that already have the table.
     _migration_19,
-
-    # 20. Spirit root spin audit log — immutable.
-    #     Guarded callable: safe to run on installs that already have the table.
     _migration_20,
 
     # =========================================================================
-    #  BUG FIXES  (migration 21)
+    #  BUG FIXES  (migrations 21–22)
     # =========================================================================
 
     # 21. Fix breakthrough_log.outcome ENUM mismatch.
-    #     Previous schema had ENUM('success','minor_fail','major_fail') but all
-    #     log_breakthrough() call sites pass 'fail'.  Guarded callable.
     _migration_21,
+
+    # 22. Add Cosmic rarity to talent ENUM columns on existing installs.
+    _migration_22,
 ]
 
 

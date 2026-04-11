@@ -121,10 +121,17 @@ async def _migration_20(total: int) -> None:
 
 async def _migration_21(total: int) -> None:
     """
-    Fix breakthrough_log.outcome ENUM — remove old 'minor_fail'/'major_fail'
-    values and normalise everything to 'success'/'fail'.
+    Fix breakthrough_log.outcome ENUM mismatch.
 
-    Skip if the column is already clean (no 'minor_fail' in the ENUM definition).
+    The table was created with ENUM('success','minor_fail','major_fail') on some
+    installs.  MySQL stores ENUM values as integer indices, so rows written with
+    the old schema have index values that no longer map to anything once the
+    ENUM definition changes — causing 'Data truncated' even on SELECT/UPDATE.
+
+    Safe approach:
+      1. Cast column to VARCHAR so all integer indices become their string labels.
+      2. Normalise all non-'success' values to 'fail'.
+      3. Cast back to the correct ENUM('success','fail').
     """
     row = await fetch_one(
         """
@@ -138,27 +145,40 @@ async def _migration_21(total: int) -> None:
     )
 
     if row is None:
-        # Table doesn't exist yet — nothing to fix
         log.debug("Migration 21/%d SKIP — breakthrough_log not found", total)
         return
 
     column_type = (row.get("COLUMN_TYPE") or "").lower()
 
-    # Only run if the old values are still present in the ENUM definition
+    # Already clean
     if "minor_fail" not in column_type and "major_fail" not in column_type:
         log.debug("Migration 21/%d SKIP — outcome ENUM already clean", total)
         return
 
-    # Step 1: normalise any rows that still carry the old values
+    log.info("Migration 21/%d — fixing breakthrough_log.outcome ENUM …", total)
+
+    # Step 1: Convert to VARCHAR — this makes all stored integer indices
+    # readable as their original string values regardless of current ENUM def.
     await execute(
         """
-        UPDATE breakthrough_log
-        SET outcome = 'fail'
-        WHERE outcome IN ('minor_fail', 'major_fail')
+        ALTER TABLE breakthrough_log
+        MODIFY COLUMN outcome VARCHAR(20) NOT NULL
         """
     )
 
-    # Step 2: shrink the ENUM now that no rows use the old values
+    # Step 2: Normalise — anything that isn't 'success' becomes 'fail'.
+    # This covers 'minor_fail', 'major_fail', empty strings, or any garbage.
+    await execute(
+        """
+        UPDATE breakthrough_log
+        SET outcome = CASE
+            WHEN outcome = 'success' THEN 'success'
+            ELSE 'fail'
+        END
+        """
+    )
+
+    # Step 3: Convert back to the correct clean ENUM.
     await execute(
         """
         ALTER TABLE breakthrough_log
@@ -166,7 +186,7 @@ async def _migration_21(total: int) -> None:
         """
     )
 
-    log.debug("Migration 21/%d OK — breakthrough_log.outcome ENUM fixed", total)
+    log.info("Migration 21/%d OK — breakthrough_log.outcome ENUM fixed", total)
 
 
 async def _migration_22(total: int) -> None:

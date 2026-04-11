@@ -5,6 +5,8 @@ import os
 from urllib.parse import urlparse
 
 import aiomysql
+import warnings
+warnings.filterwarnings("ignore", message=".*Table '.*' already exists.*")
 
 log = logging.getLogger("bot.database")
 

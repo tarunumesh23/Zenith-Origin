@@ -241,9 +241,11 @@ async def sync(ctx: commands.Context) -> None:
     await ctx.send("Synced and cleared global commands.")
 
 
-@bot.command()
+# bot.py — rename these two owner commands to avoid clashing with /lock in talent cog
+
+@bot.command(name="botlock")          # was: @bot.command()  name="lock"
 @commands.is_owner()
-async def lock(ctx: commands.Context, *, reason: str = "No reason provided.") -> None:
+async def botlock(ctx: commands.Context, *, reason: str = "No reason provided.") -> None:
     global BOT_LOCKED, LOCK_REASON
     BOT_LOCKED  = True
     LOCK_REASON = reason
@@ -256,9 +258,9 @@ async def lock(ctx: commands.Context, *, reason: str = "No reason provided.") ->
     )
 
 
-@bot.command()
+@bot.command(name="botunlock")        # was: @bot.command()  name="unlock"
 @commands.is_owner()
-async def unlock(ctx: commands.Context) -> None:
+async def botunlock(ctx: commands.Context) -> None:
     global BOT_LOCKED, LOCK_REASON
     BOT_LOCKED  = False
     LOCK_REASON = ""

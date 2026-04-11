@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import profile
 import random
 
 import discord
@@ -299,4 +300,4 @@ class Start(commands.Cog):
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(Start(bot))
+    await bot.add_cog(profile(bot))

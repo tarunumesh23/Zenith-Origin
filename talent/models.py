@@ -43,7 +43,6 @@ class PlayerTalent:
     evolution_stage: int = 0          # 0 = base, 1 = evolved, 2 = final form
     is_corrupted: bool = False
     is_locked: bool = False
-    # FIX #7: use timezone-aware datetime instead of deprecated utcnow()
     acquired_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

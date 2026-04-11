@@ -5,7 +5,7 @@ talent/cultivation_bridge.py
 ────────────────────────────
 Single source-of-truth for how an active PlayerTalent influences cultivation.
 
-All cultivation code should import *only* ``get_cultivation_bonuses`` —
+All cultivation code should import only ``get_cultivation_bonuses`` —
 it never needs to know about tags, rarities, or evolution stages directly.
 
 Bonus dict schema
@@ -36,18 +36,23 @@ _TAG_BONUSES: list[tuple[frozenset[str], str, float]] = [
     (frozenset({"qi"}),          "qi_multiplier",          0.05),
     (frozenset({"flow"}),        "qi_multiplier",          0.03),
     (frozenset({"spirit"}),      "qi_multiplier",          0.04),
+    # Cosmic tag provides additional qi accrual bonus
+    (frozenset({"cosmic"}),      "qi_multiplier",          0.10),
 
     # Breakthrough success
     (frozenset({"heaven"}),      "breakthrough_bonus",     2.0),
     (frozenset({"fate"}),        "breakthrough_bonus",     2.0),
     (frozenset({"dao"}),         "breakthrough_bonus",     3.0),
+    (frozenset({"cosmic"}),      "breakthrough_bonus",     5.0),
 
     # Overflow / double-stage chance
     (frozenset({"dao"}),         "overflow_chance",        0.02),
     (frozenset({"chaos"}),       "overflow_chance",        0.03),
+    (frozenset({"cosmic"}),      "overflow_chance",        0.05),
 
     # Negate Qi loss on breakthrough failure
     (frozenset({"rebirth"}),     "negate_qi_loss_chance",  0.15),
+    (frozenset({"cosmic"}),      "negate_qi_loss_chance",  0.10),
 
     # Meditate cooldown reduction (bonus shrinks the multiplier below 1.0)
     (frozenset({"mind"}),        "meditate_cooldown_mult", -0.05),
@@ -105,8 +110,6 @@ def get_cultivation_bonuses(active_talent: "PlayerTalent | None") -> dict[str, f
     Return a bonus dict for the active talent.
 
     If the player has no active talent, returns the identity dict (no bonuses).
-    Cultivation cogs should call this once per command invocation and pass the
-    relevant keys where needed.
     """
     result = dict(_IDENTITY)
 
@@ -114,8 +117,8 @@ def get_cultivation_bonuses(active_talent: "PlayerTalent | None") -> dict[str, f
         return result
 
     talent_tags   = frozenset(active_talent.tags)
-    rarity_mult   = active_talent.multiplier                          # e.g. 1.0, 2.0, 8.0 …
-    evolution_amp = _EVOLUTION_AMP[active_talent.evolution_stage]     # 1.0 / 1.35 / 1.75
+    rarity_mult   = active_talent.multiplier
+    evolution_amp = _EVOLUTION_AMP[active_talent.evolution_stage]
 
     for required_tags, bonus_key, base_value in _TAG_BONUSES:
         if not required_tags.issubset(talent_tags):
@@ -124,26 +127,28 @@ def get_cultivation_bonuses(active_talent: "PlayerTalent | None") -> dict[str, f
         scaled = base_value * rarity_mult * evolution_amp
 
         if bonus_key == "qi_multiplier":
-            result["qi_multiplier"] += scaled          # additive stacking
+            result["qi_multiplier"] += scaled
         elif bonus_key == "breakthrough_bonus":
             result["breakthrough_bonus"] += scaled
         elif bonus_key == "overflow_chance":
-            result["overflow_chance"] += scaled        # additive on top of default
+            result["overflow_chance"] += scaled
         elif bonus_key == "negate_qi_loss_chance":
             result["negate_qi_loss_chance"] += scaled
         elif bonus_key == "meditate_cooldown_mult":
-            result["meditate_cooldown_mult"] += scaled  # scaled is negative, so this shrinks
+            result["meditate_cooldown_mult"] += scaled   # scaled is negative → shrinks
         elif bonus_key == "qi_threshold_bonus":
             result["qi_threshold_bonus"] += scaled
 
-    # Apply caps
+    # BUG FIX: the original code used `bonus_key` from the last loop iteration
+    # instead of iterating `key` — every cap check was silently broken.
+    # Fixed: iterate over _CAPS properly.
     for key, cap in _CAPS.items():
-        if bonus_key == "meditate_cooldown_mult":
-            result[key] = max(_FLOOR.get(key, 0.0), min(result[key], cap))
+        if key in _FLOOR:
+            result[key] = max(_FLOOR[key], min(result[key], cap))
         else:
             result[key] = min(result[key], cap)
 
-    # Floor pass for any shrinking bonuses
+    # Floor pass for any shrinking bonuses (redundant after the fix above, kept for safety)
     for key, floor in _FLOOR.items():
         result[key] = max(floor, result[key])
 

@@ -14,7 +14,8 @@ from .constants import (
     FUSION_CROSS_SUCCESS_CHANCE,
     FUSION_RNG_SUCCESS_CHANCE,
     FAILURE_OUTCOMES, CROSS_FUSION_RECIPES,
-    CORRUPTION_NAMES, ONE_PER_SERVER_TALENTS,
+    CORRUPTION_NAMES, CORRUPTION_TAG_ROOTS,
+    ONE_PER_SERVER_TALENTS,
 )
 from .models import Talent, PlayerTalent, PlayerTalentData
 
@@ -54,7 +55,7 @@ def _talent_by_name(name: str) -> Optional[Talent]:
     return None
 
 
-def _player_talent_from(talent: Talent) -> PlayerTalent:
+def _player_talent_from(talent: Talent, force_corrupted: bool = False) -> PlayerTalent:
     return PlayerTalent(
         name=talent.name,
         base_name=talent.name,
@@ -64,11 +65,17 @@ def _player_talent_from(talent: Talent) -> PlayerTalent:
         color=talent.color,
         emoji=talent.emoji,
         tags=talent.tags,
+        is_corrupted=force_corrupted,
     )
 
 
+def _exclusive_pool(exclusive_type: str) -> list[dict]:
+    """Return entries that are gated behind a specific exclusive type."""
+    return [e for e in TALENT_POOL if e.get("exclusive") == exclusive_type]
+
+
 # ─────────────────────────────────────────────────────────────
-#  STARTER TALENT  (assigned on /start — pure RNG, no Divine)
+#  STARTER TALENT  (assigned on /start — pure RNG, no Divine/Cosmic)
 # ─────────────────────────────────────────────────────────────
 
 def roll_starter_talent(claimed_one_per_server: list[str]) -> PlayerTalent:
@@ -76,13 +83,14 @@ def roll_starter_talent(claimed_one_per_server: list[str]) -> PlayerTalent:
     Roll a random starting talent for a brand-new cultivator.
 
     Rules:
-    - Weighted by rarity (same weights as regular spins).
-    - Divine talents are excluded — they should be earned, not given.
-    - One-per-server talents that are already claimed are excluded.
+    - Divine and Cosmic are excluded — they should be earned.
+    - Exclusive talents (fusion/mutation/corruption) are excluded.
+    - One-per-server talents already claimed are excluded.
     """
     eligible = [
         e for e in TALENT_POOL
-        if e["rarity"] != "Divine"
+        if e["rarity"] not in ("Divine", "Cosmic")
+        and not e.get("exclusive")
         and not (e.get("one_per_server") and e["name"] in claimed_one_per_server)
     ]
 
@@ -102,6 +110,8 @@ def spin_talent(
     """
     Roll a talent for the player (token-gated spin).
 
+    Exclusive talents (fusion/mutation/corruption) and Cosmic are never spun.
+
     Returns:
         (PlayerTalent, is_pity_trigger)
     """
@@ -115,18 +125,21 @@ def spin_talent(
                 min_rarity     = tier
                 pity_triggered = True
 
-    # ── filter pool by min_rarity & one-per-server rules ────
+    # ── filter pool: no Cosmic, no exclusives, no one-per-server already claimed ──
     eligible = [
         e for e in TALENT_POOL
         if _rarity_index(e["rarity"]) >= _rarity_index(min_rarity)
+        and e["rarity"] != "Cosmic"
+        and not e.get("exclusive")
         and not (e.get("one_per_server") and e["name"] in claimed_one_per_server)
     ]
     if not eligible:
-        eligible = TALENT_POOL
+        # safety fallback — should never happen unless pool is extremely sparse
+        eligible = [e for e in TALENT_POOL if e["rarity"] not in ("Divine", "Cosmic") and not e.get("exclusive")]
 
     # ── weighted rarity selection ─────────────────────────────
     rarity_weights = {
-        r: (RARITIES[r]["weight"] if _rarity_index(r) >= _rarity_index(min_rarity) else 0)
+        r: (RARITIES[r]["weight"] if _rarity_index(r) >= _rarity_index(min_rarity) and r != "Cosmic" else 0)
         for r in RARITY_ORDER
     }
 
@@ -136,9 +149,11 @@ def spin_talent(
         k=1,
     )[0]
 
-    rarity_pool = [e for e in eligible if e["rarity"] == chosen_rarity] or eligible
-    entry       = random.choice(rarity_pool)
-    talent      = _build_talent_obj(entry)
+    rarity_pool = [e for e in eligible if e["rarity"] == chosen_rarity]
+    if not rarity_pool:
+        rarity_pool = eligible
+    entry  = random.choice(rarity_pool)
+    talent = _build_talent_obj(entry)
 
     # ── update pity counters ─────────────────────────────────
     player_data.total_spins += 1
@@ -162,12 +177,59 @@ def _resolve_failure(pity: int) -> dict:
     return {"outcome": key, **data}
 
 
-def _get_cross_recipe(t1: PlayerTalent, t2: PlayerTalent) -> Optional[str]:
+def _get_cross_recipe(t1: PlayerTalent, t2: PlayerTalent) -> Optional[dict]:
+    """
+    Return the best matching cross-fusion recipe dict or None.
+
+    Exclusive recipes take priority over standard ones.
+    Cosmic recipes require at least one Divine-rarity talent.
+    """
     combined_tags = set(t1.tags) | set(t2.tags)
-    for recipe in CROSS_FUSION_RECIPES:
-        if all(tag in combined_tags for tag in recipe["tags_required"]):
-            return recipe["result"]
+    has_divine    = t1.rarity in ("Divine", "Cosmic") or t2.rarity in ("Divine", "Cosmic")
+
+    # Sort: exclusive recipes checked first, then standard.
+    sorted_recipes = sorted(CROSS_FUSION_RECIPES, key=lambda r: (not r.get("exclusive", False)))
+
+    for recipe in sorted_recipes:
+        tags_required = set(recipe["tags_required"])
+        if not tags_required.issubset(combined_tags):
+            continue
+        if recipe.get("requires_divine") and not has_divine:
+            continue
+        return recipe
+
     return None
+
+
+def _resolve_corruption_exclusive(source_talent: PlayerTalent) -> Optional[PlayerTalent]:
+    """
+    BUFFED: Try to produce an exclusive corruption-only root based on the source talent's tags.
+    Falls back to a named corrupted variant of the source if no exclusive matches.
+    """
+    talent_tags = set(source_talent.tags)
+
+    # Try to match an exclusive corruption root
+    for required_tags, root_name in CORRUPTION_TAG_ROOTS:
+        if required_tags.issubset(talent_tags):
+            entry = next((e for e in TALENT_POOL if e["name"] == root_name), None)
+            if entry:
+                pt = _player_talent_from(_build_talent_obj(entry), force_corrupted=True)
+                return pt
+
+    # Fallback: named corrupted variant or "Darkened <name>"
+    corrupt_name  = CORRUPTION_NAMES.get(source_talent.name, f"Darkened {source_talent.name}")
+    rarity_data   = RARITIES[source_talent.rarity]
+    return PlayerTalent(
+        name=corrupt_name,
+        base_name=source_talent.base_name,
+        rarity=source_talent.rarity,
+        description="A dark, twisted version. Something went very wrong.",
+        multiplier=source_talent.multiplier * 0.6,   # BUFFED: was 0.5 → now 0.6
+        color=0x2C2C2C,
+        emoji="☠️",
+        is_corrupted=True,
+        tags=source_talent.tags,
+    )
 
 
 def fuse_talents(
@@ -181,33 +243,32 @@ def fuse_talents(
 
     mode: "auto" | "same" | "cross" | "rng"
       - "auto"  → engine decides based on rarity match
-      - "same"  → force same-rarity path (error if rarities differ)
+      - "same"  → force same-rarity path
       - "cross" → force cross-fusion path
       - "rng"   → pure random regardless of rarities
 
     Returns a result dict:
     {
-        "success": bool,
-        "result_talent": PlayerTalent | None,
-        "failure_outcome": str | None,
+        "success":             bool,
+        "result_talent":       PlayerTalent | None,
+        "failure_outcome":     str | None,
         "failure_description": str | None,
-        "pity_bonus": bool,
-        "pity_guarantee": bool,
-        "new_pity": int,
-        "resolved_mode": str,   # actual mode used (for db logging)
+        "pity_bonus":          bool,
+        "pity_guarantee":      bool,
+        "new_pity":            int,
+        "resolved_mode":       str,
     }
     """
     player_data.total_fusions += 1
     pity = player_data.fusion_pity
 
-    # ── FIX #5: resolve mode independently from success-chance ──
-    # User-supplied mode is respected; "auto" picks same vs cross.
+    # ── resolve mode ────────────────────────────────────────
     if mode == "auto":
         resolved_mode = "same" if talent_a.rarity == talent_b.rarity else "cross"
     elif mode in ("same", "cross", "rng"):
         resolved_mode = mode
     else:
-        resolved_mode = "cross"  # safe fallback
+        resolved_mode = "cross"
 
     if resolved_mode == "same":
         base_chance = FUSION_SAME_RARITY_SUCCESS_CHANCE
@@ -217,8 +278,6 @@ def fuse_talents(
         base_chance = FUSION_CROSS_SUCCESS_CHANCE
 
     # ── pity bonuses ─────────────────────────────────────────
-    # FIX #8 note: at pity ≥ 15 all three flags are True;
-    # guarantee overrides boost for the roll, tier_up still fires.
     pity_bonus     = pity >= FUSION_PITY["boost"]
     pity_guarantee = pity >= FUSION_PITY["guarantee"]
     pity_tier_up   = pity >= FUSION_PITY["bonus"]
@@ -235,38 +294,46 @@ def fuse_talents(
     if success:
         player_data.fusion_pity = 0
 
-        result_talent = None
+        result_talent: Optional[PlayerTalent] = None
 
         if resolved_mode == "same":
             new_rarity = _bump_rarity(talent_a.rarity)
-            pool = [e for e in TALENT_POOL if e["rarity"] == new_rarity]
+            # Exclude exclusives from normal same-rarity fusion result pool
+            pool = [e for e in TALENT_POOL if e["rarity"] == new_rarity and not e.get("exclusive")]
             if pool:
                 result_talent = _player_talent_from(_build_talent_obj(random.choice(pool)))
 
         elif resolved_mode == "cross":
-            recipe_name = _get_cross_recipe(talent_a, talent_b)
-            if recipe_name:
-                t = _talent_by_name(recipe_name)
+            recipe = _get_cross_recipe(talent_a, talent_b)
+            if recipe:
+                t = _talent_by_name(recipe["result"])
                 if t:
                     result_talent = _player_talent_from(t)
             if not result_talent:
+                # No recipe matched — fall back to bumped rarity from the higher of the two
                 higher_rarity = max(
                     talent_a.rarity, talent_b.rarity,
                     key=lambda r: _rarity_index(r),
                 )
                 new_rarity = _bump_rarity(higher_rarity)
-                pool = [e for e in TALENT_POOL if e["rarity"] == new_rarity]
+                pool = [e for e in TALENT_POOL if e["rarity"] == new_rarity and not e.get("exclusive")]
                 if pool:
                     result_talent = _player_talent_from(_build_talent_obj(random.choice(pool)))
 
         else:  # rng
-            pool = [e for e in TALENT_POOL if e["rarity"] != "Trash"]
-            result_talent = _player_talent_from(_build_talent_obj(random.choice(pool)))
+            # Exclude Cosmic, Divine, and exclusives from pure-rng roll
+            pool = [
+                e for e in TALENT_POOL
+                if e["rarity"] not in ("Trash", "Cosmic")
+                and not e.get("exclusive")
+            ]
+            if pool:
+                result_talent = _player_talent_from(_build_talent_obj(random.choice(pool)))
 
-        # pity tier-up: bump result rarity one extra step
+        # pity tier-up: bump result rarity one extra step (excluding exclusives and Cosmic)
         if pity_tier_up and result_talent:
             bumped_rarity = _bump_rarity(result_talent.rarity)
-            pool = [e for e in TALENT_POOL if e["rarity"] == bumped_rarity]
+            pool = [e for e in TALENT_POOL if e["rarity"] == bumped_rarity and not e.get("exclusive") and bumped_rarity != "Cosmic"]
             if pool:
                 result_talent = _player_talent_from(_build_talent_obj(random.choice(pool)))
 
@@ -285,27 +352,26 @@ def fuse_talents(
         player_data.fusion_pity = pity + 1
         failure = _resolve_failure(pity)
 
-        result_talent = None
+        result_talent: Optional[PlayerTalent] = None
+
         if failure["outcome"] == "corruption":
-            corrupt_name = CORRUPTION_NAMES.get(talent_a.name, f"Darkened {talent_a.name}")
-            result_talent = PlayerTalent(
-                name=corrupt_name,
-                base_name=talent_a.base_name,
-                rarity=talent_a.rarity,
-                description="A dark, twisted version. Something went very wrong.",
-                multiplier=talent_a.multiplier * 0.5,
-                color=0x2C2C2C,
-                emoji="☠️",
-                is_corrupted=True,
-                tags=talent_a.tags,
-            )
+            # BUFFED: corruption now produces exclusive corruption roots
+            result_talent = _resolve_corruption_exclusive(talent_a)
 
         elif failure["outcome"] == "mutation":
-            pool = [
-                e for e in TALENT_POOL
-                if _rarity_index(e["rarity"]) >= _rarity_index("Rare")
-            ]
-            result_talent = _player_talent_from(_build_talent_obj(random.choice(pool)))
+            # NERFED: mutation now draws from the exclusive mutation pool only
+            mutation_pool = _exclusive_pool("mutation")
+            if mutation_pool:
+                result_talent = _player_talent_from(_build_talent_obj(random.choice(mutation_pool)))
+            else:
+                # Safety fallback if pool somehow empty
+                pool = [
+                    e for e in TALENT_POOL
+                    if _rarity_index(e["rarity"]) >= _rarity_index("Rare")
+                    and not e.get("exclusive")
+                ]
+                if pool:
+                    result_talent = _player_talent_from(_build_talent_obj(random.choice(pool)))
 
         return {
             "success":             False,
@@ -337,6 +403,7 @@ def evolve_talent(
     if talent.evolution_stage >= 2:
         return False, talent, "This talent has already reached its **Final Form**. ✦✦"
 
+    # Look up by base_name so evolved talents can still find their entry
     entry = next((e for e in TALENT_POOL if e["name"] == talent.base_name), None)
     if not entry or not entry.get("evolution"):
         return False, talent, "This talent **cannot evolve**."
@@ -397,7 +464,7 @@ def accept_talent(
 
     When replacing, the old active talent is pushed to inventory.
     The caller is responsible for removing new_talent from inventory
-    if it was promoted from there (to avoid duplication).
+    before calling this (to avoid duplication).
     """
     if replace_active:
         old = player_data.active_talent

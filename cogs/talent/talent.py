@@ -22,7 +22,7 @@ from talent.engine import (
     reject_talent,
     toggle_lock,
 )
-from talent.cultivation_bridge import describe_bonuses  # CHANGE 1
+from talent.cultivation_bridge import describe_bonuses
 from talent.models import PlayerTalent, PlayerTalentData
 from db import talent as db
 from ui.embed import build_embed, error_embed
@@ -30,6 +30,8 @@ from ui.embed import build_embed, error_embed
 log = logging.getLogger("bot.cogs.talent")
 
 INVENTORY_MAX = 20
+# Maximum tokens a player can gift to another in one call
+GIFT_MAX = 5
 
 
 # ---------------------------------------------------------------------------
@@ -45,10 +47,7 @@ def _rarity_color(rarity: str) -> discord.Color:
 
 
 def _enrich_talent(talent: PlayerTalent) -> PlayerTalent:
-    """
-    Fill in color and emoji from RARITIES if the talent was loaded from DB
-    (DB rows don't store these derived fields).
-    """
+    """Fill in color and emoji from RARITIES if the talent was loaded from DB."""
     rarity_data   = RARITIES.get(talent.rarity, {})
     talent.color  = rarity_data.get("color", 0xFFFFFF)
     talent.emoji  = rarity_data.get("emoji", "")
@@ -95,10 +94,22 @@ def _talent_embed(
     talent      = _enrich_talent(talent)
     rarity_data = RARITIES.get(talent.rarity, {})
     stage_label = ["", " ✦", " ✦✦"][talent.evolution_stage]
-    flags = "  ".join(filter(None, [
-        "🔒 Locked"    if talent.is_locked    else "",
-        "☠️ Corrupted" if talent.is_corrupted else "",
-    ]))
+
+    is_cosmic = talent.rarity == "Cosmic"
+    flags_parts = []
+    if talent.is_locked:
+        flags_parts.append("🔒 Locked")
+    if talent.is_corrupted:
+        flags_parts.append("☠️ Corrupted")
+    if is_cosmic:
+        flags_parts.append("🌌 Cosmic Tier")
+    flags = "  ".join(flags_parts)
+
+    exclusive_note = ""
+    if talent.is_corrupted:
+        exclusive_note = "\n*[Corruption Exclusive]*"
+    elif is_cosmic:
+        exclusive_note = "\n*[Cosmic Exclusive — Unreachable by normal means]*"
 
     desc = (
         f"{talent.emoji} **{talent.name}**{stage_label}\n"
@@ -106,6 +117,7 @@ def _talent_embed(
         f"**Multiplier:** ×{talent.multiplier:.2f}\n"
         f"**Tags:** {', '.join(talent.tags) if talent.tags else '—'}\n\n"
         f"*{talent.description}*"
+        f"{exclusive_note}"
     )
     if flags:
         desc += f"\n\n{flags}"
@@ -151,12 +163,11 @@ class Talent(commands.Cog):
         if player.active_talent is None:
             await ctx.send(
                 embed=error_embed(ctx, title="No Active Talent",
-                                  description="You have no talent yet. Ask a mod for a spin token."),
+                                  description="You have no talent yet. Use `/use_spin` if you have tokens."),
                 ephemeral=True,
             )
             return
 
-        # CHANGE 2 — include cultivation bonuses in the embed
         pity_lines = "\n".join(
             f"**{tier}:** {player.spin_pity.get(tier, 0)} / {threshold}"
             for tier, threshold in SPIN_PITY.items()
@@ -205,11 +216,12 @@ class Talent(commands.Cog):
         for i, t in enumerate(player.inventory, start=1):
             t           = _enrich_talent(t)
             stage_label = ["", " ✦", " ✦✦"][t.evolution_stage]
-            lock        = "🔒" if t.is_locked else ""
+            lock        = "🔒" if t.is_locked    else ""
             corrupt     = "☠️" if t.is_corrupted else ""
+            cosmic      = "🌌" if t.rarity == "Cosmic" else ""
             lines.append(
                 f"`{i:>2}.` {t.emoji} **{t.name}**{stage_label} "
-                f"[{t.rarity}] ×{t.multiplier:.2f} {lock}{corrupt}"
+                f"[{t.rarity}] ×{t.multiplier:.2f} {lock}{corrupt}{cosmic}"
             )
 
         desc  = "\n".join(lines)
@@ -311,12 +323,16 @@ class Talent(commands.Cog):
                 pity_note = "\n\n✨ *Fusion pity bonus applied (+20% chance).*"
 
             if result_talent:
+                cosmic_fanfare = ""
+                if result_talent.rarity == "Cosmic":
+                    cosmic_fanfare = "\n\n🌌✨ **COSMIC TALENT AWAKENED!** The heavens tremble. ✨🌌"
+
                 embed = _talent_embed(
                     ctx, result_talent,
                     title="⚗️ Fusion Successful!",
                     extra_desc=(
                         f"**{talent_a.name}** + **{talent_b.name}** → **{result_talent.name}**"
-                        f"{pity_note}"
+                        f"{pity_note}{cosmic_fanfare}"
                     ),
                 )
             else:
@@ -332,17 +348,29 @@ class Talent(commands.Cog):
 
             if failure == "corruption" and result["result_talent"]:
                 player.inventory.append(result["result_talent"])
+                rt = result["result_talent"]
+                exclusive_note = (
+                    "\n\n☠️ *A corruption exclusive root has awakened from the darkness.*"
+                    if rt.is_corrupted else ""
+                )
                 embed = _talent_embed(
-                    ctx, result["result_talent"],
-                    title="💀 Fusion Failed — Corruption",
-                    extra_desc=f"*{failure_desc}*\n\nPity counter: **{result['new_pity']}**",
+                    ctx, rt,
+                    title="💀 Fusion Failed — Corruption Awakens",
+                    extra_desc=(
+                        f"*{failure_desc}*{exclusive_note}"
+                        f"\n\nFusion pity counter: **{result['new_pity']}**"
+                    ),
                 )
             elif failure == "mutation" and result["result_talent"]:
                 player.inventory.append(result["result_talent"])
                 embed = _talent_embed(
                     ctx, result["result_talent"],
-                    title="🧬 Fusion Failed — Mutation!",
-                    extra_desc=f"*{failure_desc}*\n\nPity counter: **{result['new_pity']}**",
+                    title="🧬 Fusion Failed — Rare Mutation!",
+                    extra_desc=(
+                        f"*{failure_desc}*"
+                        f"\n\n🧬 *A mutation-exclusive root has emerged — this cannot be spun.*"
+                        f"\n\nFusion pity counter: **{result['new_pity']}**"
+                    ),
                 )
             else:
                 title_map = {
@@ -352,24 +380,20 @@ class Talent(commands.Cog):
                 embed = build_embed(
                     ctx,
                     title=title_map.get(failure, "❌ Fusion Failed"),
-                    description=f"*{failure_desc}*\n\nPity counter: **{result['new_pity']}**",
+                    description=f"*{failure_desc}*\n\nFusion pity counter: **{result['new_pity']}**",
                     color=discord.Color.red(),
                     show_footer=True,
                 )
 
         await db.save_player_talent_data(player)
-
-        # FIX #1/#2: pass strings, not objects; use resolved_mode for the ENUM
         await db.log_fusion(
             discord_id=ctx.author.id,
             guild_id=guild_id,
             talent_a=talent_a.name,
             talent_b=talent_b.name,
-            mode=result["resolved_mode"],          # "same" / "cross" / "rng"
+            mode=result["resolved_mode"],
             success=result["success"],
-            result_name=(
-                result["result_talent"].name if result.get("result_talent") else None
-            ),
+            result_name=(result["result_talent"].name if result.get("result_talent") else None),
             failure_outcome=result.get("failure_outcome"),
         )
 
@@ -496,12 +520,9 @@ class Talent(commands.Cog):
 
         chosen = inv[slot - 1]
 
-        # FIX #4: remove chosen from inventory BEFORE calling accept_talent
-        # so it can never appear in both active and inventory simultaneously.
+        # Remove from inventory BEFORE accept_talent to avoid duplication
         player.inventory = [t for t in player.inventory if t is not chosen]
-
         msg = accept_talent(player, chosen, replace_active=True)
-        # accept_talent sets chosen as active and pushes old active to inventory.
 
         await db.save_player_talent_data(player)
 
@@ -510,138 +531,164 @@ class Talent(commands.Cog):
             ephemeral=True,
         )
 
-    # =========================================================================
-    # ADMIN COMMANDS
-    # =========================================================================
+    # ── /tokens ───────────────────────────────────────────────────────────
 
-    @commands.hybrid_group(name="admin_talent", description="Admin talent management")
-    @commands.has_permissions(manage_guild=True)
-    async def admin_talent(self, ctx: commands.Context) -> None:
-        pass
+    @commands.hybrid_command(
+        name="tokens",
+        description="Check how many spin tokens you have",
+    )
+    @commands.cooldown(1, 5, commands.BucketType.user)
+    async def tokens(self, ctx: commands.Context) -> None:
+        if ctx.interaction:
+            await ctx.interaction.response.defer(ephemeral=True)
 
-    @admin_talent.command(name="grant_spin", description="Grant spin token(s) to a user")
-    @commands.has_permissions(manage_guild=True)
-    async def grant_spin(
+        row = await _guard_cultivator(ctx)
+        if row is None:
+            return
+
+        guild_id = ctx.guild.id if ctx.guild else 0
+        count    = await db.get_spin_tokens(ctx.author.id, guild_id)
+
+        await ctx.send(
+            embed=build_embed(
+                ctx,
+                title="🎟️ Spin Tokens",
+                description=(
+                    f"You have **{count}** spin token(s).\n\n"
+                    f"Use `/use_spin` to roll, or `/gift_spin @user` to share tokens with another cultivator."
+                ),
+                color=discord.Color.gold(),
+                show_footer=True,
+            ),
+            ephemeral=True,
+        )
+
+    # ── /gift_spin ────────────────────────────────────────────────────────
+
+    @commands.hybrid_command(
+        name="gift_spin",
+        description="Gift spin token(s) from your balance to another cultivator",
+    )
+    @commands.cooldown(1, 30, commands.BucketType.user)
+    async def gift_spin(
         self,
         ctx: commands.Context,
         member: discord.Member,
         amount: int = 1,
     ) -> None:
+        """
+        Transfer 1–GIFT_MAX spin tokens from yourself to another registered cultivator.
+        Cannot gift to yourself or bots.
+        30-second cooldown to prevent spam-gifting.
+        """
         if ctx.interaction:
             await ctx.interaction.response.defer(ephemeral=True)
 
-        if amount < 1:
+        if member.id == ctx.author.id:
             await ctx.send(
-                embed=error_embed(ctx, title="Invalid Amount",
-                                  description="Amount must be at least 1."),
+                embed=error_embed(ctx, title="Invalid Target",
+                                  description="You cannot gift tokens to yourself."),
                 ephemeral=True,
             )
             return
 
+        if member.bot:
+            await ctx.send(
+                embed=error_embed(ctx, title="Invalid Target",
+                                  description="Bots don't walk the Path."),
+                ephemeral=True,
+            )
+            return
+
+        if not (1 <= amount <= GIFT_MAX):
+            await ctx.send(
+                embed=error_embed(ctx, title="Invalid Amount",
+                                  description=f"You can gift between **1** and **{GIFT_MAX}** token(s) at once."),
+                ephemeral=True,
+            )
+            return
+
+        row = await _guard_cultivator(ctx)
+        if row is None:
+            return
+
         guild_id = ctx.guild.id if ctx.guild else 0
+
+        # Verify recipient is a cultivator
+        try:
+            from db import cultivators as cult_db
+            target_row = await cult_db.get_cultivator(member.id)
+        except Exception:
+            log.exception("Talent » gift_spin: DB lookup failed for target=%s", member.id)
+            await ctx.send(
+                embed=error_embed(ctx, title="Database Error",
+                                  description="Could not verify target cultivator. Try again later."),
+                ephemeral=True,
+            )
+            return
+
+        if target_row is None:
+            await ctx.send(
+                embed=error_embed(ctx, title="Not a Cultivator",
+                                  description=f"{member.mention} hasn't started their Path yet."),
+                ephemeral=True,
+            )
+            return
+
+        sender_tokens = await db.get_spin_tokens(ctx.author.id, guild_id)
+        if sender_tokens < amount:
+            await ctx.send(
+                embed=error_embed(
+                    ctx, title="Not Enough Tokens",
+                    description=(
+                        f"You only have **{sender_tokens}** token(s). "
+                        f"You need **{amount}** to complete this gift."
+                    ),
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # Deduct then add — no atomic DB transaction assumed, but order matters:
+        # deduct first so a crash doesn't duplicate tokens.
+        await db.consume_spin_token(ctx.author.id, guild_id, count=amount)
         await db.add_spin_tokens(member.id, guild_id, amount)
 
         log.info(
-            "Talent » grant_spin  admin=%s  target=%s  amount=%d",
+            "Talent » gift_spin  sender=%s  recipient=%s  amount=%d",
             ctx.author.id, member.id, amount,
         )
 
         await ctx.send(
             embed=build_embed(
                 ctx,
-                title="🎟️ Spin Token Granted",
+                title="🎁 Spin Token(s) Gifted",
                 description=(
-                    f"**{amount}** spin token(s) granted to {member.mention}.\n"
-                    f"They can now use `/use_spin` to roll their talent."
+                    f"**{ctx.author.display_name}** sent **{amount}** spin token(s) "
+                    f"to {member.mention}!\n\n"
+                    f"🎟️ Your remaining tokens: **{sender_tokens - amount}**"
                 ),
                 color=discord.Color.green(),
                 show_footer=True,
             ),
-            ephemeral=True,
+            ephemeral=False,  # public so recipient sees the notification
         )
 
-    @admin_talent.command(name="view", description="View any user's talent profile")
-    @commands.has_permissions(manage_guild=True)
-    async def admin_view(self, ctx: commands.Context, member: discord.Member) -> None:
-        if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
-
-        guild_id = ctx.guild.id if ctx.guild else 0
-        player   = await _load_player(member.id, guild_id)
-        tokens   = await db.get_spin_tokens(member.id, guild_id)
-
-        lines = [
-            f"**Tokens available:** {tokens}",
-            f"**Total spins:** {player.total_spins}",
-            f"**Total fusions:** {player.total_fusions}",
-        ]
-
-        if player.active_talent:
-            t           = _enrich_talent(player.active_talent)
-            stage_label = ["", " ✦", " ✦✦"][t.evolution_stage]
-            lines.append(
-                f"\n**Active:** {t.emoji} {t.name}{stage_label} [{t.rarity}] ×{t.multiplier:.2f}"
-            )
-        else:
-            lines.append("\n**Active:** None")
-
-        if player.inventory:
-            lines.append(f"\n**Inventory ({len(player.inventory)}/{INVENTORY_MAX}):**")
-            for i, t in enumerate(player.inventory, 1):
-                t           = _enrich_talent(t)
-                stage_label = ["", " ✦", " ✦✦"][t.evolution_stage]
-                lock        = "🔒" if t.is_locked    else ""
-                corrupt     = "☠️" if t.is_corrupted else ""
-                lines.append(f"`{i:>2}.` {t.emoji} **{t.name}**{stage_label} [{t.rarity}] {lock}{corrupt}")
-        else:
-            lines.append("\n**Inventory:** Empty")
-
-        await ctx.send(
-            embed=build_embed(
-                ctx,
-                title=f"🔍 {member.display_name}'s Talent Profile",
-                description="\n".join(lines),
-                color=discord.Color.blurple(),
-                show_footer=True,
-            ),
-            ephemeral=True,
-        )
-
-    @admin_talent.command(name="reset", description="Wipe a user's entire talent data")
-    @commands.has_permissions(administrator=True)
-    async def admin_reset(self, ctx: commands.Context, member: discord.Member) -> None:
-        if ctx.interaction:
-            await ctx.interaction.response.defer(ephemeral=True)
-
-        guild_id = ctx.guild.id if ctx.guild else 0
-        await db.reset_player_talent_data(member.id, guild_id)
-
-        log.warning(
-            "Talent » admin_reset  admin=%s  target=%s",
-            ctx.author.id, member.id,
-        )
-
-        await ctx.send(
-            embed=build_embed(
-                ctx,
-                title="🗑️ Talent Data Reset",
-                description=f"All talent data for {member.mention} has been wiped.",
-                color=discord.Color.red(),
-                show_footer=True,
-            ),
-            ephemeral=True,
-        )
-
-    # =========================================================================
-    # PLAYER SPIN (token-gated)
-    # =========================================================================
+    # ── /use_spin ─────────────────────────────────────────────────────────
 
     @commands.hybrid_command(
         name="use_spin",
-        description="Use a spin token to roll for a talent",
+        description="Open a spin session — use as many tokens as you want in one go",
     )
-    @commands.cooldown(1, 5, commands.BucketType.user)
+    @commands.cooldown(1, 10, commands.BucketType.user)
     async def use_spin(self, ctx: commands.Context) -> None:
+        """
+        Opens a multi-spin session.  Each roll consumes one token.
+        After each roll four buttons appear:
+          ✅ Accept & Spin Again | ✅ Accept & Stop
+          ❌ Discard & Spin Again | ❌ Discard & Stop
+        "Spin Again" buttons are disabled when tokens run out or inventory is full.
+        """
         if ctx.interaction:
             await ctx.interaction.response.defer()
 
@@ -654,8 +701,13 @@ class Talent(commands.Cog):
 
         if tokens < 1:
             await ctx.send(
-                embed=error_embed(ctx, title="No Spin Tokens",
-                                  description="You have no spin tokens. Ask a mod to grant you one."),
+                embed=error_embed(
+                    ctx, title="No Spin Tokens",
+                    description=(
+                        "You have no spin tokens.\n\n"
+                        "Ask a mod to grant you one, or another cultivator can `/gift_spin` you theirs."
+                    ),
+                ),
                 ephemeral=True,
             )
             return
@@ -666,103 +718,173 @@ class Talent(commands.Cog):
             await ctx.send(
                 embed=error_embed(
                     ctx, title="Inventory Full",
-                    description=f"Your inventory is full ({INVENTORY_MAX} slots). "
-                                f"Fuse or discard talents to make room.",
+                    description=(
+                        f"Your inventory is full ({INVENTORY_MAX} slots). "
+                        f"Fuse or discard talents to make room before spinning."
+                    ),
                 ),
                 ephemeral=True,
             )
             return
 
-        claimed                = await db.get_claimed_one_per_server(guild_id)
-        talent, pity_triggered = spin_talent(player, claimed)
+        await _do_spin(ctx, player, guild_id, tokens, message=None)
 
-        await db.consume_spin_token(ctx.author.id, guild_id)
-        await db.save_player_talent_data(player)
 
-        # FIX #1: pass strings, not the PlayerTalent object
-        await db.log_spin(
-            ctx.author.id, guild_id,
-            talent.name,
-            talent.rarity,
-            pity_triggered,
-            accepted=False,
-        )
+# ---------------------------------------------------------------------------
+# Multi-spin engine
+# ---------------------------------------------------------------------------
 
-        pity_note  = "\n\n✨ *Pity threshold reached — guaranteed pull!*" if pity_triggered else ""
-        token_line = f"\n\n🎟️ **Spin tokens remaining:** {tokens - 1}"
+async def _do_spin(
+    ctx: commands.Context,
+    player: PlayerTalentData,
+    guild_id: int,
+    tokens: int,
+    message: Optional[discord.Message],
+) -> None:
+    """
+    Execute one spin roll, consume the token, then edit/send the message
+    with a _SpinSessionView so the player can immediately roll again.
+    """
+    claimed                = await db.get_claimed_one_per_server(guild_id)
+    talent, pity_triggered = spin_talent(player, claimed)
 
-        view  = _AcceptRejectView(ctx, player, talent, guild_id)
-        embed = _talent_embed(
-            ctx, talent,
-            title="🎲 Talent Revealed",
-            extra_desc=f"Accept this talent or discard it?{pity_note}{token_line}",
-        )
+    await db.consume_spin_token(ctx.author.id, guild_id)
+    tokens_left = tokens - 1
+
+    await db.save_player_talent_data(player)
+    await db.log_spin(
+        ctx.author.id, guild_id,
+        talent.name,
+        talent.rarity,
+        pity_triggered,
+        accepted=False,
+    )
+
+    pity_note  = "\n\n✨ *Pity threshold reached — guaranteed pull!*" if pity_triggered else ""
+    inv_line   = f"`{len(player.inventory)} / {INVENTORY_MAX}` inventory slots used"
+    token_line = f"🎟️ **Tokens remaining:** {tokens_left}"
+
+    extra = f"Accept or discard?{pity_note}\n\n{token_line}\n{inv_line}"
+    embed = _talent_embed(ctx, talent, title="🎲 Talent Revealed", extra_desc=extra)
+    view  = _SpinSessionView(ctx, player, talent, guild_id, tokens_left)
+
+    if message is None:
         await ctx.send(embed=embed, view=view)
+    else:
+        await message.edit(embed=embed, view=view)
 
 
 # ---------------------------------------------------------------------------
-# Accept / Reject UI
+# Multi-spin session view
 # ---------------------------------------------------------------------------
 
-class _AcceptRejectView(discord.ui.View):
+class _SpinSessionView(discord.ui.View):
+    """
+    Displayed after every spin roll.
+
+    Four buttons across two rows:
+      Row 0: ✅ Accept & Spin Again | ✅ Accept & Stop
+      Row 1: ❌ Discard & Spin Again | ❌ Discard & Stop
+
+    "Spin Again" variants are disabled when the player has no tokens left
+    or their inventory is at capacity.
+    """
+
     def __init__(
         self,
         ctx: commands.Context,
         player: PlayerTalentData,
         talent: PlayerTalent,
         guild_id: int,
+        tokens_left: int,
     ) -> None:
-        super().__init__(timeout=60)
-        self.ctx      = ctx
-        self.player   = player
-        self.talent   = talent
-        self.guild_id = guild_id
+        super().__init__(timeout=90)
+        self.ctx         = ctx
+        self.player      = player
+        self.talent      = talent
+        self.guild_id    = guild_id
+        self.tokens_left = tokens_left
+
+        can_spin_again = tokens_left > 0 and len(player.inventory) < INVENTORY_MAX
+        self.accept_spin.disabled  = not can_spin_again
+        self.discard_spin.disabled = not can_spin_again
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.ctx.author.id
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(
+                "This spin session belongs to someone else.", ephemeral=True
+            )
+            return False
+        return True
 
     async def on_timeout(self) -> None:
         for item in self.children:
             item.disabled = True  # type: ignore[union-attr]
 
-    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success)
-    async def accept_button(
+    # ── shared accept helper ──────────────────────────────────────────────
+
+    async def _do_accept(self, interaction: discord.Interaction) -> str:
+        replace = self.player.active_talent is None
+        msg     = accept_talent(self.player, self.talent, replace_active=replace)
+        await db.save_player_talent_data(self.player)
+        await db.mark_last_spin_accepted(interaction.user.id, self.guild_id)
+        if self.talent.name in ONE_PER_SERVER_TALENTS:
+            await db.claim_one_per_server(self.guild_id, interaction.user.id, self.talent.name)
+        return msg
+
+    # ── ✅ Accept & Spin Again ────────────────────────────────────────────
+
+    @discord.ui.button(label="✅ Accept & Spin Again", style=discord.ButtonStyle.success, row=0)
+    async def accept_spin(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         self.stop()
+        await self._do_accept(interaction)
+        await interaction.response.defer()
+        await _do_spin(self.ctx, self.player, self.guild_id, self.tokens_left, message=interaction.message)
 
-        replace = self.player.active_talent is None
-        msg     = accept_talent(self.player, self.talent, replace_active=replace)
+    # ── ✅ Accept & Stop ──────────────────────────────────────────────────
 
-        await db.save_player_talent_data(self.player)
-        await db.mark_last_spin_accepted(interaction.user.id, self.guild_id)
-
-        if self.talent.name in ONE_PER_SERVER_TALENTS:
-            await db.claim_one_per_server(self.guild_id, interaction.user.id, self.talent.name)
-
+    @discord.ui.button(label="✅ Accept & Stop", style=discord.ButtonStyle.primary, row=0)
+    async def accept_stop(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.stop()
+        msg = await self._do_accept(interaction)
         await interaction.response.edit_message(
             embed=build_embed(
                 interaction,  # type: ignore[arg-type]
                 title="✅ Talent Accepted",
-                description=msg,
+                description=f"{msg}\n\n🎟️ Tokens remaining: **{self.tokens_left}**",
                 color=discord.Color.green(),
             ),
             view=None,
         )
 
-    @discord.ui.button(label="❌ Discard", style=discord.ButtonStyle.danger)
-    async def reject_button(
+    # ── ❌ Discard & Spin Again ───────────────────────────────────────────
+
+    @discord.ui.button(label="❌ Discard & Spin Again", style=discord.ButtonStyle.danger, row=1)
+    async def discard_spin(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         self.stop()
+        reject_talent(self.talent)
+        await interaction.response.defer()
+        await _do_spin(self.ctx, self.player, self.guild_id, self.tokens_left, message=interaction.message)
 
+    # ── ❌ Discard & Stop ─────────────────────────────────────────────────
+
+    @discord.ui.button(label="❌ Discard & Stop", style=discord.ButtonStyle.secondary, row=1)
+    async def discard_stop(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.stop()
         msg = reject_talent(self.talent)
-
         await interaction.response.edit_message(
             embed=build_embed(
                 interaction,  # type: ignore[arg-type]
                 title="❌ Talent Discarded",
-                description=msg,
+                description=f"{msg}\n\n🎟️ Tokens remaining: **{self.tokens_left}**",
                 color=discord.Color.red(),
             ),
             view=None,

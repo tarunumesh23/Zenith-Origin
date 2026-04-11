@@ -4,9 +4,14 @@ talent/cultivation_bridge.py
 Translates a PlayerTalent's tags and multiplier into concrete cultivation
 bonuses used by cultivate.py and breakthrough.py.
 
-Also serves as the single import point for spirit-root bonus helpers so that
-breakthrough.py and spirit_roots/__init__.py can import everything from here
-without creating circular imports.
+Also re-exports Spirit Root bonus helpers so that breakthrough.py and
+cultivate.py have a single import point and circular imports are avoided.
+
+Import order safety
+-------------------
+This module imports from spirit_roots.cultivation_bridge at the bottom
+(deferred / inside functions is NOT needed — spirit_roots never imports
+from talent/, so there is no cycle).
 """
 from __future__ import annotations
 
@@ -35,34 +40,56 @@ _IDENTITY: dict[str, float] = {
     "breakthrough_bonus":     0.00,
     "overflow_chance":        0.05,   # base overflow chance even with no talent
     "negate_qi_loss_chance":  0.00,
-    "meditate_cooldown_mult": 1.00,   # 1.0 = full cooldown, < 1.0 = reduced
+    "meditate_cooldown_mult": 1.00,
     "qi_threshold_bonus":     0.00,
 }
 
 # ---------------------------------------------------------------------------
 # Tag → bonus mapping
-# Each tag contributes a flat amount to one or more bonus keys.
-# The talent multiplier scales the total contribution.
+#
+# IMPORTANT: these tags must match what's actually in TALENT_POOL entries.
+# Talent tags use thematic words (fire, body, dragon, etc.).
+# We map those thematic tags to mechanical bonuses here.
 # ---------------------------------------------------------------------------
 _TAG_BONUSES: dict[str, dict[str, float]] = {
-    "qi_boost": {
-        "qi_multiplier": 0.10,
-    },
-    "breakthrough": {
-        "breakthrough_bonus": 5.0,
-    },
-    "overflow": {
-        "overflow_chance": 0.03,
-    },
-    "resilience": {
-        "negate_qi_loss_chance": 0.10,
-    },
-    "swift": {
-        "meditate_cooldown_mult": -0.10,
-    },
-    "threshold": {
-        "qi_threshold_bonus": 0.05,
-    },
+    # Qi accrual tags
+    "qi":           {"qi_multiplier": 0.08},
+    "flow":         {"qi_multiplier": 0.06},
+    "spirit":       {"qi_multiplier": 0.05},
+
+    # Breakthrough tags
+    "heaven":       {"breakthrough_bonus": 3.0, "overflow_chance": 0.01},
+    "dao":          {"breakthrough_bonus": 4.0},
+    "fate":         {"breakthrough_bonus": 2.0},
+    "rebirth":      {"negate_qi_loss_chance": 0.08, "overflow_chance": 0.01},
+
+    # Body / endurance tags
+    "body":         {"qi_threshold_bonus": 0.04, "negate_qi_loss_chance": 0.03},
+    "iron":         {"qi_threshold_bonus": 0.03},
+    "earth":        {"qi_threshold_bonus": 0.04},
+
+    # Speed / cooldown tags
+    "wind":         {"meditate_cooldown_mult": -0.05},
+    "speed":        {"meditate_cooldown_mult": -0.04},
+    "lightning":    {"meditate_cooldown_mult": -0.06, "qi_multiplier": 0.04},
+
+    # Combat / chaos tags (smaller cultivation benefit)
+    "fire":         {"qi_multiplier": 0.06, "breakthrough_bonus": 1.0},
+    "water":        {"breakthrough_bonus": 2.0, "negate_qi_loss_chance": 0.04},
+    "wood":         {"qi_multiplier": 0.04, "qi_threshold_bonus": 0.02},
+    "dragon":       {"qi_multiplier": 0.07, "qi_threshold_bonus": 0.03},
+    "chaos":        {"overflow_chance": 0.02, "breakthrough_bonus": 1.0},
+    "void":         {"overflow_chance": 0.02, "meditate_cooldown_mult": -0.03},
+    "shadow":       {"meditate_cooldown_mult": -0.03, "negate_qi_loss_chance": 0.03},
+    "star":         {"breakthrough_bonus": 2.0, "overflow_chance": 0.01},
+    "mind":         {"breakthrough_bonus": 2.0, "meditate_cooldown_mult": -0.04},
+    "ice":          {"negate_qi_loss_chance": 0.05, "qi_threshold_bonus": 0.03},
+    "cosmic":       {"qi_multiplier": 0.15, "breakthrough_bonus": 5.0, "overflow_chance": 0.03},
+    "combat":       {"qi_threshold_bonus": 0.02},
+
+    # Exclusive/special tags
+    "space":        {"meditate_cooldown_mult": -0.05, "overflow_chance": 0.01},
+    "defense":      {"negate_qi_loss_chance": 0.05, "qi_threshold_bonus": 0.03},
 }
 
 
@@ -138,44 +165,23 @@ def describe_bonuses(talent: "PlayerTalent | None") -> str:
     if thr > 0:
         lines.append(f"📈 Qi threshold **+{thr * 100:.0f}%**")
 
-    return "\n".join(lines) if lines else "No cultivation bonuses."
+    return "\n".join(lines) if lines else "No cultivation bonuses from this talent."
 
 
 # ---------------------------------------------------------------------------
-# Spirit Root proxies
+# Spirit Root proxies — import from the real implementation, not ourselves
 # ---------------------------------------------------------------------------
-# spirit_roots/__init__.py and breakthrough.py import these from here to
-# avoid circular imports (spirit_roots → talent → spirit_roots).
 
-def get_spirit_root_bonuses(root_value: int | None) -> dict[str, float]:
-    """
-    Proxy for spirit_roots.cultivation_bridge.get_spirit_root_bonuses.
-    Import this from talent.cultivation_bridge to avoid circular imports.
-    """
-    from talent.cultivation_bridge import (
-        get_spirit_root_bonuses as _get,
-    )
-    return _get(root_value)
+from spirit_roots.cultivation_bridge import (          # noqa: E402
+    get_spirit_root_bonuses,
+    describe_spirit_root_bonuses,
+    merge_bonuses,
+)
 
-
-def describe_spirit_root_bonuses(root_value: int | None) -> str:
-    """
-    Proxy for spirit_roots.cultivation_bridge.describe_spirit_root_bonuses.
-    Import this from talent.cultivation_bridge to avoid circular imports.
-    """
-    from talent.cultivation_bridge import (
-        describe_spirit_root_bonuses as _describe,
-    )
-    return _describe(root_value)
-
-
-def merge_bonuses(
-    talent_bonuses: dict[str, float],
-    root_bonuses: dict[str, float],
-) -> dict[str, float]:
-    """
-    Proxy for spirit_roots.cultivation_bridge.merge_bonuses.
-    Import this from talent.cultivation_bridge to avoid circular imports.
-    """
-    from talent.cultivation_bridge import merge_bonuses as _merge
-    return _merge(talent_bonuses, root_bonuses)
+__all__ = [
+    "get_cultivation_bonuses",
+    "describe_bonuses",
+    "get_spirit_root_bonuses",
+    "describe_spirit_root_bonuses",
+    "merge_bonuses",
+]

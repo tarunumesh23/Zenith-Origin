@@ -39,7 +39,7 @@ import discord
 log = logging.getLogger("bot.ui.interaction_utils")
 
 # Discord error codes we silently suppress
-_EXPIRED_CODES    = {10062}   # Unknown interaction — expired or already used
+_EXPIRED_CODES    = {10062, 10015}   # 10062 = expired interaction, 10015 = unknown webhook
 _RESPONDED_MSG    = "already been acknowledged"  # substring in InteractionResponded msg
 
 

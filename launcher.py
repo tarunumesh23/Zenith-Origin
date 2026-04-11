@@ -14,6 +14,8 @@ def get_time():
 # Patterns to suppress entirely (noisy but harmless)
 _SUPPRESS_PATTERNS = [
     re.compile(r"Warning: Table '.+' already exists"),
+    re.compile(r"aiomysql"),                          # ADD THIS
+    re.compile(r"cursors\.py"),                       # ADD THIS
     re.compile(r"await self\._query\(query\)"),
     re.compile(r"await self\._read_query_result"),
     re.compile(r"await result\.read\(\)"),

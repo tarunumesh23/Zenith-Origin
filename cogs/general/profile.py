@@ -23,7 +23,7 @@ log = logging.getLogger("bot.cogs.start")
 CULTIVATION_LOG_CHANNEL = int(os.getenv("CULTIVATION_LOG_CHANNEL", "0"))
 
 
-class Start(commands.Cog):
+class profile(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.active_users: set[int] = set()

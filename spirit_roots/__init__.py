@@ -1,5 +1,4 @@
 # spirit_roots/__init__.py
-# ``spirit_roots`` so they never need to drill into sub-modules.
 from .data import (
     PITY_THRESHOLD,
     FLOOR_GAP,
@@ -10,7 +9,6 @@ from .data import (
     roll_root,
 )
 from .engine import SpinResult, resolve_spin
-from talent.cultivation_bridge import get_spirit_root_bonuses, describe_spirit_root_bonuses
 
 __all__ = [
     # data
@@ -24,7 +22,4 @@ __all__ = [
     # engine
     "SpinResult",
     "resolve_spin",
-    # cultivation bridge
-    "get_spirit_root_bonuses",
-    "describe_spirit_root_bonuses",
 ]

@@ -1,49 +1,213 @@
+"""
+cogs/general/help.py
+~~~~~~~~~~~~~~~~~~~~~
+Paginated /help command with a category dropdown.
+
+Fixes over the original
+-----------------------
+* Covers BOTH hybrid commands (get_commands) AND pure app_commands
+  (walk_app_commands) — the original missed all slash-only commands.
+* cmd.checks are no longer evaluated with a Context — slash checks expect
+  an Interaction; we skip check evaluation entirely and just show all
+  non-hidden commands (staff-only commands stay hidden via cmd.hidden).
+* HelpSelect.callback and HelpView.interaction_check use safe_* wrappers
+  so a stale click never raises.
+* on_timeout no longer tries to edit a dead message — it only marks items
+  disabled locally.
+* pages dict is properly split into a typed CategoryPage dataclass instead
+  of a mixed Embed | dict abomination.
+* Single-category fast-path respects hybrid vs prefix context correctly.
+* Cooldown error is handled gracefully.
+"""
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass, field
+
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from ui.embed import build_embed
+from ui.interaction_utils import safe_send, safe_edit, safe_defer
+
+log = logging.getLogger("bot.cogs.general.help")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 _HIDDEN_COGS: frozenset[str] = frozenset({"General"})
 
-# Map subfolder name → display label + emoji
 _CATEGORY_META: dict[str, tuple[str, str]] = {
-    "general":     ("⚙️ General",      "Core bot commands"),
-    "cultivation": ("🌿 Cultivation",  "Qi, meditation & breakthroughs"),
-    "pvp":         ("⚔️ PvP",           "Combat, duels & ambushes"),
-    "talent":      ("🌟 Talent",        "Talents, spins & fusion"),
-    "admin":       ("🛠️ Admin",         "Staff-only commands"),
+    "general":      ("⚙️ General",      "Core bot commands"),
+    "cultivation":  ("🌿 Cultivation",  "Qi, meditation & breakthroughs"),
+    "pvp":          ("⚔️ PvP",           "Combat, duels & ambushes"),
+    "talent":       ("🌟 Talent",        "Talents, spins & fusion"),
+    "spirit_roots": ("🌱 Spirit Roots",  "Root awakening, pity & bonuses"),
+    "admin":        ("🛠️ Admin",         "Staff-only commands"),
 }
-_FALLBACK_CATEGORY = ("📦 Other", "Miscellaneous commands")
+_FALLBACK_CATEGORY: tuple[str, str] = ("📦 Other", "Miscellaneous commands")
 
+# ---------------------------------------------------------------------------
+# Internal data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CategoryPage:
+    key:   str
+    label: str
+    desc:  str
+    embed: discord.Embed
+    count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _category_for_cog(cog: commands.Cog) -> str:
     """
     Derive a category key from the cog's module path.
-    e.g. 'cogs.cultivation.cultivate' → 'cultivation'
-         'cogs.general.help'          → 'general'
+
+    'cogs.cultivation.cultivate' → 'cultivation'
+    'cogs.general.help'          → 'general'
     """
     module = getattr(cog, "__module__", "") or ""
     parts  = module.split(".")
-    # parts[0] == 'cogs', parts[1] == subfolder, parts[2] == filename
-    if len(parts) >= 3 and parts[0] == "cogs":
-        return parts[1]
     if len(parts) >= 2 and parts[0] == "cogs":
         return parts[1]
     return "__other__"
 
 
+def _cmd_signature(name: str, signature: str, description: str) -> str:
+    sig = f"`/{name}"
+    if signature:
+        sig += f" {signature}"
+    sig += f"` — {description or 'No description'}"
+    return sig
+
+
+def _collect_commands(bot: commands.Bot) -> dict[str, list[str]]:
+    """
+    Walk every cog and collect visible command signatures, bucketed by category.
+
+    Covers:
+    • Hybrid / prefix commands via cog.get_commands()
+    • Pure app_commands via cog.__cog_app_commands__ (slash-only commands
+      that are NOT registered as hybrid commands are invisible to
+      get_commands() and were silently dropped by the original code)
+
+    We intentionally skip check evaluation — slash command checks expect
+    an Interaction, not a Context.  Hidden commands are the correct way to
+    exclude staff commands from the help menu.
+    """
+    buckets: dict[str, list[str]] = {}
+
+    for cog_name, cog in sorted(bot.cogs.items()):
+        if cog_name in _HIDDEN_COGS:
+            continue
+
+        cat_key = _category_for_cog(cog)
+        seen_names: set[str] = set()  # prevent duplicates from hybrid overlap
+
+        # 1. Hybrid / prefix commands
+        for cmd in cog.get_commands():
+            if cmd.hidden:
+                continue
+            seen_names.add(cmd.name)
+            buckets.setdefault(cat_key, []).append(
+                _cmd_signature(
+                    cmd.name,
+                    cmd.signature or "",
+                    cmd.description or cmd.brief or "",
+                )
+            )
+
+        # 2. Pure app_commands (slash-only, not surfaced by get_commands)
+        for app_cmd in getattr(cog, "__cog_app_commands__", []):
+            if getattr(app_cmd, "hidden", False):
+                continue
+            if app_cmd.name in seen_names:
+                continue  # already listed via hybrid path
+            seen_names.add(app_cmd.name)
+
+            # Build a human-readable parameter hint from the command's parameters
+            params = getattr(app_cmd, "_params", {})
+            param_hint = " ".join(
+                f"<{p}>" if param.required else f"[{p}]"
+                for p, param in params.items()
+            ) if params else ""
+
+            buckets.setdefault(cat_key, []).append(
+                _cmd_signature(
+                    app_cmd.name,
+                    param_hint,
+                    getattr(app_cmd, "description", "") or "",
+                )
+            )
+
+    return buckets
+
+
+def _build_pages(
+    ctx: commands.Context,
+    buckets: dict[str, list[str]],
+) -> dict[str, CategoryPage]:
+    """Build one CategoryPage per bucket key."""
+    pages: dict[str, CategoryPage] = {}
+
+    for cat_key, cmd_lines in sorted(buckets.items()):
+        label, desc = _CATEGORY_META.get(cat_key, _FALLBACK_CATEGORY)
+        embed = build_embed(
+            ctx,
+            title=f"{label} Commands",
+            description=f"*{desc}*\n\n" + "\n".join(cmd_lines),
+            color=discord.Color.blurple(),
+        )
+        pages[cat_key] = CategoryPage(
+            key=cat_key,
+            label=label,
+            desc=desc,
+            embed=embed,
+            count=len(cmd_lines),
+        )
+
+    return pages
+
+
+def _build_overview(ctx: commands.Context, pages: dict[str, CategoryPage]) -> discord.Embed:
+    overview_lines = [
+        f"**{p.label}** — {p.count} command(s)"
+        for p in pages.values()
+    ]
+    return build_embed(
+        ctx,
+        title="📖 Help — Command Categories",
+        description=(
+            "Use `/command` or `z!command` for any listed command.\n"
+            "Arguments: `<required>` · `[optional]`\n\n"
+            + "\n".join(overview_lines)
+            + "\n\n*Select a category from the dropdown below.*"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# UI components
+# ---------------------------------------------------------------------------
+
 class HelpSelect(discord.ui.Select):
-    def __init__(self, pages: dict[str, discord.Embed]) -> None:
-        self.pages = pages
+    def __init__(self, pages: dict[str, CategoryPage]) -> None:
+        self._pages = pages
         options = [
             discord.SelectOption(
-                label=label,
-                value=key,
-                description=desc[:100],
+                label=page.label,
+                value=page.key,
+                description=f"{page.count} command(s)"[:100],
             )
-            for key, (label, desc) in pages["__meta__"].items()
+            for page in pages.values()
         ]
         super().__init__(
             placeholder="Choose a category…",
@@ -53,32 +217,49 @@ class HelpSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        key   = self.values[0]
-        embed = self.pages.get(key)
-        if embed:
-            await interaction.response.edit_message(embed=embed, view=self.view)
-        else:
-            await interaction.response.defer()
+        key  = self.values[0]
+        page = self._pages.get(key)
+        if page is None:
+            await safe_defer(interaction)
+            return
+        # edit_message works here because this interaction is on a message component
+        try:
+            await interaction.response.edit_message(embed=page.embed, view=self.view)
+        except discord.InteractionResponded:
+            pass
+        except discord.NotFound:
+            pass  # interaction expired — silently ignore
+        except Exception:
+            log.exception("HelpSelect.callback: unexpected error  id=%s", interaction.id)
 
 
 class HelpView(discord.ui.View):
-    def __init__(self, pages: dict[str, discord.Embed], author_id: int) -> None:
+    def __init__(self, pages: dict[str, CategoryPage], author_id: int) -> None:
         super().__init__(timeout=120)
         self.author_id = author_id
         self.add_item(HelpSelect(pages))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "This menu belongs to someone else.", ephemeral=True
+            await safe_send(
+                interaction,
+                "This menu belongs to someone else.",
+                ephemeral=True,
             )
             return False
         return True
 
     async def on_timeout(self) -> None:
+        # Mark items disabled locally for correctness.
+        # We have no interaction token here, so we cannot edit the message.
         for item in self.children:
-            item.disabled = True  # type: ignore[union-attr]
+            if hasattr(item, "disabled"):
+                item.disabled = True  # type: ignore[union-attr]
 
+
+# ---------------------------------------------------------------------------
+# Cog
+# ---------------------------------------------------------------------------
 
 class General(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
@@ -87,84 +268,47 @@ class General(commands.Cog):
     @commands.hybrid_command(name="help", description="Browse all commands by category")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def help(self, ctx: commands.Context) -> None:
-        # ── 1. Bucket commands by subfolder category ──────────────────
-        buckets: dict[str, list[str]] = {}
-
-        for cog_name, cog in sorted(self.bot.cogs.items()):
-            if cog_name in _HIDDEN_COGS:
-                continue
-
-            cat_key = _category_for_cog(cog)
-
-            for cmd in cog.get_commands():
-                if cmd.hidden:
-                    continue
-                try:
-                    if cmd.checks and not all(check(ctx) for check in cmd.checks):
-                        continue
-                except Exception:
-                    continue
-
-                sig = f"`/{cmd.name}"
-                if cmd.signature:
-                    sig += f" {cmd.signature}"
-                sig += f"` — {cmd.description or cmd.brief or 'No description'}"
-
-                buckets.setdefault(cat_key, []).append(sig)
+        buckets = _collect_commands(self.bot)
 
         if not buckets:
             await ctx.send(
-                embed=build_embed(ctx, title="Help", description="No commands available.",
-                                  color=discord.Color.blurple()),
+                embed=build_embed(
+                    ctx,
+                    title="Help",
+                    description="No commands available.",
+                    color=discord.Color.blurple(),
+                ),
                 ephemeral=True,
             )
             return
 
-        # ── 2. Build one embed per category + overview embed ──────────
-        # pages["__meta__"] holds {key: (label, desc)} for the select menu
-        pages: dict[str, discord.Embed | dict] = {"__meta__": {}}
+        pages    = _build_pages(ctx, buckets)
+        overview = _build_overview(ctx, pages)
 
-        overview_lines: list[str] = []
-
-        for cat_key, cmd_lines in sorted(buckets.items()):
-            label, desc = _CATEGORY_META.get(cat_key, _FALLBACK_CATEGORY)
-
-            # record meta for select options
-            pages["__meta__"][cat_key] = (label, f"{len(cmd_lines)} command(s)")  # type: ignore[index]
-
-            embed = build_embed(
-                ctx,
-                title=f"{label} Commands",
-                description=(
-                    f"*{desc}*\n\n"
-                    + "\n".join(cmd_lines)
-                ),
-                color=discord.Color.blurple(),
-            )
-            pages[cat_key] = embed
-
-            overview_lines.append(f"**{label}** — {len(cmd_lines)} command(s)")
-
-        overview_embed = build_embed(
-            ctx,
-            title="📖 Help — Command Categories",
-            description=(
-                "Use `/command` or `z!command` for any listed command.\n"
-                "Arguments: `<required>` · `[optional]`\n\n"
-                + "\n".join(overview_lines)
-                + "\n\n*Select a category from the dropdown below.*"
-            ),
-            color=discord.Color.blurple(),
-        )
-
-        # ── 3. If only one category exists, skip the dropdown ─────────
-        non_meta = {k: v for k, v in pages.items() if k != "__meta__"}
-        if len(non_meta) == 1:
-            await ctx.send(embed=next(iter(non_meta.values())), ephemeral=True)  # type: ignore[arg-type]
+        # Fast-path: only one category → skip the dropdown
+        if len(pages) == 1:
+            only_page = next(iter(pages.values()))
+            await ctx.send(embed=only_page.embed, ephemeral=True)
             return
 
-        view = HelpView(pages, ctx.author.id)  # type: ignore[arg-type]
-        await ctx.send(embed=overview_embed, view=view, ephemeral=True)
+        view = HelpView(pages, ctx.author.id)
+        await ctx.send(embed=overview, view=view, ephemeral=True)
+
+    @help.error
+    async def help_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(
+                embed=build_embed(
+                    ctx,
+                    title="⏳ Slow down",
+                    description=f"You can use `/help` again in **{error.retry_after:.1f}s**.",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+                delete_after=6,
+            )
+        else:
+            log.exception("help command error", exc_info=error)
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -12,6 +12,8 @@ Changes in this revision
       ON DUPLICATE KEY UPDATE col = new_row.col
 • ``consume_spin_token`` retains the ``count`` keyword argument (fixes the
   AdminTalent.revoke_spin TypeError from the original single-arg version).
+• Fixed ambiguous ``tokens`` column in ``add_spin_tokens`` ODKU clause —
+  qualified the existing-row reference as ``spin_tokens.tokens``.
 """
 from __future__ import annotations
 
@@ -69,7 +71,6 @@ async def upsert_player_talent(
     now       = _now_naive()
     tags_json = json.dumps(tags or [])
 
-    # FIX: replaced deprecated VALUES(col) with row alias pattern
     await execute(
         """
         INSERT INTO player_talents
@@ -253,7 +254,6 @@ async def upsert_spin_pity(
     pity_mythical: int,
     total_spins: int,
 ) -> None:
-    # FIX: replaced deprecated VALUES(col) with row alias pattern
     await execute(
         """
         INSERT INTO talent_spin_pity
@@ -287,7 +287,6 @@ async def upsert_fusion_pity(
     fusion_pity: int,
     total_fusions: int,
 ) -> None:
-    # FIX: replaced deprecated VALUES(col) with row alias pattern
     await execute(
         """
         INSERT INTO talent_fusion_pity
@@ -316,13 +315,17 @@ async def get_spin_tokens(discord_id: int, guild_id: int) -> int:
 
 
 async def add_spin_tokens(discord_id: int, guild_id: int, amount: int) -> None:
-    # FIX: replaced deprecated VALUES(col) with row alias pattern
+    # FIX: qualify existing-row reference as spin_tokens.tokens to resolve the
+    # "Column 'tokens' in field list is ambiguous" OperationalError (1052).
+    # The row alias `new_row` is unambiguous for the inserted value;
+    # `spin_tokens.tokens` is unambiguous for the current stored value.
     await execute(
         """
         INSERT INTO spin_tokens (discord_id, guild_id, tokens)
         VALUES (%s, %s, %s)
         AS new_row
-        ON DUPLICATE KEY UPDATE tokens = tokens + new_row.tokens
+        ON DUPLICATE KEY UPDATE
+            tokens = spin_tokens.tokens + new_row.tokens
         """,
         (discord_id, guild_id, amount),
     )

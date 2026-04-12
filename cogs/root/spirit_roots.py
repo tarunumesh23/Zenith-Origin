@@ -16,16 +16,6 @@ Mechanics
 • Safe System: rolling below your current root is blocked; you keep what you have.
 • Floor System: can never roll more than FLOOR_GAP tiers below your personal best.
 • One free spin per SPIN_COOLDOWN_SECONDS.
-
-DB contract (replace the _db_* stubs with your real async calls)
------------------------------------------------------------------
-Table: spirit_roots
-  user_id          BIGINT PRIMARY KEY
-  current_value    SMALLINT NOT NULL DEFAULT 1
-  best_value       SMALLINT NOT NULL DEFAULT 1
-  pity_counter     SMALLINT NOT NULL DEFAULT 0
-  total_spins      INT      NOT NULL DEFAULT 0
-  last_spin_at     TIMESTAMPTZ
 """
 from __future__ import annotations
 
@@ -39,13 +29,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import db.spirit_roots as sr_db
 from spirit_roots.cultivation_bridge import (
     describe_spirit_root_bonuses,
     get_spirit_root_bonuses,
 )
 from spirit_roots.data import (
     PITY_THRESHOLD,
-    ROOT_TIERS,
     SPIN_COOLDOWN_SECONDS,
     get_tier_by_value,
 )
@@ -63,8 +53,6 @@ log = logging.getLogger("bot.cogs.spirit_roots")
 # ---------------------------------------------------------------------------
 # Rarity override — patches spirit_roots.data at import time
 # ---------------------------------------------------------------------------
-# data.py ships with placeholder weights; we replace them here so the cog
-# fully owns rarity without touching shared game-data files.
 
 import spirit_roots.data as _srd  # noqa: E402
 
@@ -91,38 +79,44 @@ _srd._BY_VALUE = {t.value: t for t in _srd.ROOT_TIERS}
 
 
 # ---------------------------------------------------------------------------
-# DB stubs — replace with your real async DB layer
+# DB layer — wired to db/spirit_roots.py
 # ---------------------------------------------------------------------------
 
-async def _db_get_or_create(user_id: int) -> dict[str, Any]:
+async def _db_get_or_create(user_id: int, guild_id: int) -> dict[str, Any]:
     """
-    Fetch the spirit_roots row for *user_id*, creating a default row if absent.
+    Fetch the player's spirit root record, creating a Tier-1 row if absent.
+    Returns a plain dict matching the shape _do_spin / _profile_embed expect.
+    """
+    record = await sr_db.get_spirit_root(user_id, guild_id)
+    if record is None:
+        record = await sr_db.create_spirit_root(user_id, guild_id, root_value=1)
+    return {
+        "user_id":       record.discord_id,
+        "current_value": record.current_value,
+        "best_value":    record.best_value,
+        "pity_counter":  record.pity_counter,
+        "total_spins":   record.total_spins,
+        "last_spin_at":  record.last_spin_at,
+    }
 
-    Must return a dict with keys:
-        user_id, current_value, best_value, pity_counter, total_spins, last_spin_at
-    ``last_spin_at`` should be a timezone-aware ``datetime`` or ``None``.
-    """
-    raise NotImplementedError(
-        "_db_get_or_create: wire up your DB layer. "
-        "Return dict keys: user_id / current_value / best_value / "
-        "pity_counter / total_spins / last_spin_at"
+
+async def _db_apply_spin(user_id: int, guild_id: int, result: SpinResult) -> None:
+    """Persist spin outcome, append audit log, and set cooldown."""
+    await sr_db.apply_spin_result(
+        discord_id=user_id,
+        guild_id=guild_id,
+        rolled_value=result.rolled_tier.value,
+        outcome=result.outcome,
+        pity_triggered=result.pity_triggered,
     )
-
-
-async def _db_apply_spin(user_id: int, result: SpinResult) -> None:
-    """
-    Persist the outcome of one resolved spin.
-
-    Suggested SQL (asyncpg):
-        UPDATE spirit_roots
-        SET current_value = $1,
-            best_value    = GREATEST(best_value, $1),
-            pity_counter  = $2,
-            total_spins   = total_spins + 1,
-            last_spin_at  = NOW()
-        WHERE user_id = $3
-    """
-    raise NotImplementedError("_db_apply_spin: wire up your DB layer.")
+    await sr_db.log_spin(
+        discord_id=user_id,
+        guild_id=guild_id,
+        rolled_value=result.rolled_tier.value,
+        pity_triggered=result.pity_triggered,
+        outcome=result.outcome,
+    )
+    await sr_db.set_spin_cooldown(user_id, SPIN_COOLDOWN_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +230,6 @@ def _profile_embed(row: dict[str, Any], user: discord.User | discord.Member) -> 
     if bonuses_text and bonuses_text != "No cultivation bonuses.":
         embed.add_field(name="📊 Active Bonuses", value=bonuses_text, inline=False)
 
-    # Timestamp goes in a field (not footer) so Discord's <t:> tag renders
     last_spin: datetime | None = row.get("last_spin_at")
     if last_spin is not None:
         if last_spin.tzinfo is None:
@@ -286,17 +279,16 @@ def _root_info_embed() -> discord.Embed:
 class SpinView(discord.ui.View):
     """
     Single 'Spin Again' button attached to every spin result.
-
     Owned by the user who triggered the original spin.
     Disables itself on first click to prevent double-fires.
-    Expires after 60 seconds (on_timeout just marks items disabled locally;
-    the interaction token is gone so no message edit is possible).
+    Expires after 60 seconds.
     """
 
-    def __init__(self, cog: "SpiritRootsCog", user_id: int) -> None:
+    def __init__(self, cog: "SpiritRootsCog", user_id: int, guild_id: int) -> None:
         super().__init__(timeout=60)
-        self.cog     = cog
-        self.user_id = user_id
+        self.cog      = cog
+        self.user_id  = user_id
+        self.guild_id = guild_id
 
     @discord.ui.button(label="🎲 Spin Again", style=discord.ButtonStyle.primary)
     async def spin_again(
@@ -304,7 +296,6 @@ class SpinView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        # Guard: only the original user may use this button
         if interaction.user.id != self.user_id:
             await safe_send(
                 interaction,
@@ -316,26 +307,18 @@ class SpinView(discord.ui.View):
             )
             return
 
-        # Disable the button before deferring to prevent any double-click
         button.disabled = True
 
-        # Defer immediately — must happen before any slow work
         deferred = await safe_defer(interaction, ephemeral=False, thinking=True)
         if not deferred:
-            # Interaction window already closed — nothing we can do
             return
 
-        # Push the disabled-button state to Discord
         await safe_edit(interaction, view=self)
 
-        # Slow path: DB read + RNG + DB write
-        result_embed, new_view = await self.cog._do_spin(interaction.user)
-
-        # Replace the message with the new spin result
+        result_embed, new_view = await self.cog._do_spin(interaction.user, self.guild_id)
         await safe_edit(interaction, embed=result_embed, view=new_view)
 
     async def on_timeout(self) -> None:
-        # Mark items disabled locally for correctness; cannot edit — token is gone
         for item in self.children:
             if hasattr(item, "disabled"):
                 item.disabled = True  # type: ignore[attr-defined]
@@ -350,7 +333,6 @@ class SpiritRootsCog(commands.Cog, name="Spirit Roots"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # defaultdict — one permanent lock per user, created on first access
         self._spin_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     # ------------------------------------------------------------------
@@ -360,38 +342,39 @@ class SpiritRootsCog(commands.Cog, name="Spirit Roots"):
     async def _do_spin(
         self,
         user: discord.User | discord.Member,
+        guild_id: int,
     ) -> tuple[discord.Embed, SpinView | None]:
         """
-        Resolve one spin attempt for *user*.
+        Resolve one spin attempt for *user* in *guild_id*.
 
         Returns ``(embed, view)``.
         *view* is ``None`` when the user is on cooldown (no button shown).
         """
         async with self._spin_locks[user.id]:
-            row = await _db_get_or_create(user.id)
+            row = await _db_get_or_create(user.id, guild_id)
 
-            # Cooldown check
-            last_spin: datetime | None = row.get("last_spin_at")
-            if last_spin is not None:
-                if last_spin.tzinfo is None:
-                    last_spin = last_spin.replace(tzinfo=timezone.utc)
-                elapsed = (datetime.now(tz=timezone.utc) - last_spin).total_seconds()
-                if elapsed < SPIN_COOLDOWN_SECONDS:
-                    return _cooldown_embed(SPIN_COOLDOWN_SECONDS - elapsed, user), None
+            # Cooldown check — prefer db cooldown table over last_spin_at heuristic
+            cooldown_expiry = await sr_db.get_spin_cooldown(user.id)
+            if cooldown_expiry is not None:
+                if cooldown_expiry.tzinfo is None:
+                    cooldown_expiry = cooldown_expiry.replace(tzinfo=timezone.utc)
+                now = datetime.now(tz=timezone.utc)
+                if now < cooldown_expiry:
+                    seconds_left = (cooldown_expiry - now).total_seconds()
+                    return _cooldown_embed(seconds_left, user), None
 
-            # Resolve spin
             result = resolve_spin(
                 current_value=row["current_value"],
                 best_value=row["best_value"],
                 pity_counter=row["pity_counter"],
             )
 
-            # Persist
-            await _db_apply_spin(user.id, result)
+            await _db_apply_spin(user.id, guild_id, result)
 
         log.info(
-            "spin  user=%s  rolled=%s  final=%s  outcome=%s  pity=%d→%d",
+            "spin  user=%s  guild=%s  rolled=%s  final=%s  outcome=%s  pity=%d→%d",
             user.id,
+            guild_id,
             result.rolled_tier.name,
             result.final_tier.name,
             result.outcome,
@@ -399,7 +382,7 @@ class SpiritRootsCog(commands.Cog, name="Spirit Roots"):
             result.pity_after,
         )
 
-        return _spin_embed(result, user), SpinView(self, user.id)
+        return _spin_embed(result, user), SpinView(self, user.id, guild_id)
 
     # ------------------------------------------------------------------
     # Slash commands
@@ -412,7 +395,8 @@ class SpiritRootsCog(commands.Cog, name="Spirit Roots"):
     @app_commands.guild_only()
     @interaction_handler(ephemeral=False, thinking=True)
     async def spin_root(self, interaction: discord.Interaction) -> None:
-        embed, view = await self._do_spin(interaction.user)
+        guild_id = interaction.guild_id or 0
+        embed, view = await self._do_spin(interaction.user, guild_id)
         await safe_edit(interaction, embed=embed, view=view)
 
     @app_commands.command(
@@ -427,8 +411,9 @@ class SpiritRootsCog(commands.Cog, name="Spirit Roots"):
         interaction: discord.Interaction,
         user: discord.Member | None = None,
     ) -> None:
-        target = user or interaction.user
-        row    = await _db_get_or_create(target.id)
+        target   = user or interaction.user
+        guild_id = interaction.guild_id or 0
+        row      = await _db_get_or_create(target.id, guild_id)
         await safe_edit(interaction, embed=_profile_embed(row, target))
 
     @app_commands.command(
@@ -450,24 +435,12 @@ class SpiritRootsCog(commands.Cog, name="Spirit Roots"):
     ) -> None:
         original = getattr(error, "original", error)
 
-        if isinstance(original, NotImplementedError):
-            embed = discord.Embed(
-                title="⚙️ Not Configured",
-                description=(
-                    "The database layer hasn't been connected yet.\n"
-                    "Replace `_db_get_or_create` and `_db_apply_spin` "
-                    "in `cogs/spirit_roots.py` with your real DB calls."
-                ),
-                colour=0xE74C3C,
-            )
-        else:
-            log.exception("Unhandled error in SpiritRootsCog", exc_info=original)
-            embed = discord.Embed(
-                title="❌ Something Went Wrong",
-                description="An unexpected error occurred. Please try again later.",
-                colour=0xE74C3C,
-            )
-
+        log.exception("Unhandled error in SpiritRootsCog", exc_info=original)
+        embed = discord.Embed(
+            title="❌ Something Went Wrong",
+            description="An unexpected error occurred. Please try again later.",
+            colour=0xE74C3C,
+        )
         await safe_respond_or_followup(interaction, embed=embed, ephemeral=True)
 
 

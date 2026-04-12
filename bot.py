@@ -6,6 +6,8 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass, field
+from typing import Final
 
 import discord
 from discord.ext import commands
@@ -22,12 +24,17 @@ from ui.status import send_status
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s  %(levelname)-8s  %(name)-20s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
 )
 log = logging.getLogger("bot")
 
-logging.getLogger("discord.client").setLevel(logging.WARNING)
+for noisy_logger in ("discord.client", "discord.gateway", "discord.http"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 logging.getLogger("discord.player").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
@@ -37,29 +44,85 @@ load_dotenv()
 
 
 def _require_env(key: str) -> str:
-    value = os.getenv(key)
+    """Return the value of a required environment variable or exit."""
+    value = os.getenv(key, "").strip()
     if not value:
         log.critical("Missing required environment variable: %s", key)
         sys.exit(1)
     return value
 
 
-TOKEN            = _require_env("token")
-REQUIRED_ROLE_ID = int(_require_env("REQUIRED_ROLE_ID"))
-REQUIRE_ROLE     = os.getenv("REQUIRE_ROLE", "true").lower() == "true"
-OWNER_ID         = int(os.getenv("OWNER_ID", "0"))
+def _optional_int(key: str, default: int = 0) -> int:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Env var %s='%s' is not a valid integer; using default %d", key, raw, default)
+        return default
 
-EXCLUDED_FOLDERS = {"ui", "__pycache__"}
-UNREGISTERED_ALLOWED = {"start"}
+
+TOKEN: Final[str]            = _require_env("token")
+REQUIRED_ROLE_ID: Final[int] = int(_require_env("REQUIRED_ROLE_ID"))
+REQUIRE_ROLE: Final[bool]    = os.getenv("REQUIRE_ROLE", "true").lower() == "true"
+OWNER_ID: Final[int]         = _optional_int("OWNER_ID")
+
+EXCLUDED_FOLDERS: Final[frozenset[str]] = frozenset({"ui", "__pycache__"})
+UNREGISTERED_ALLOWED: Final[frozenset[str]] = frozenset({"start"})
 
 # ---------------------------------------------------------------------------
-# Global lock state — defined at module level so global_check can see them
+# Lock state — encapsulated in a dataclass to avoid scattered globals
 # ---------------------------------------------------------------------------
-BOT_LOCKED  = False
-LOCK_REASON = "No reason provided."
+@dataclass
+class BotLock:
+    locked: bool = False
+    reason: str  = "No reason provided."
+
+    def acquire(self, reason: str = "No reason provided.") -> None:
+        self.locked = True
+        self.reason = reason
+        log.warning("Bot locked. Reason: %s", reason)
+
+    def release(self) -> None:
+        self.locked = False
+        self.reason = ""
+        log.info("Bot unlocked.")
+
+    @property
+    def embed_locked(self) -> discord.Embed:
+        return discord.Embed(
+            title="🔒 Bot Locked",
+            description=f"The bot is currently locked by the owner.\n\n**Reason:** {self.reason}",
+            color=discord.Color.red(),
+        )
+
+    @property
+    def embed_unlocked(self) -> discord.Embed:
+        return discord.Embed(
+            title="🔓 Bot Unlocked",
+            description="Bot is now operational again.",
+            color=discord.Color.green(),
+        )
+
+
+lock_state = BotLock()
 
 # ---------------------------------------------------------------------------
-# Bot setup
+# Bot runtime state — encapsulated to avoid scattered module-level flags
+# ---------------------------------------------------------------------------
+@dataclass
+class BotState:
+    ready: bool              = False
+    started: bool            = False
+    start_time: float | None = None
+    shutdown_triggered: bool = False
+
+
+state = BotState()
+
+# ---------------------------------------------------------------------------
+# Intents & bot instance
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -68,12 +131,8 @@ bot = commands.Bot(
     command_prefix=["z!", "Z!"],
     intents=intents,
     help_command=None,
+    case_insensitive=True,
 )
-
-_ready             = False
-_started           = False
-_start_time: float | None = None
-_shutdown_triggered = False
 
 
 # ---------------------------------------------------------------------------
@@ -86,24 +145,15 @@ async def global_check(ctx: commands.Context) -> bool:
         return True
 
     # Bot lock check
-    if BOT_LOCKED:
-        await ctx.send(
-            embed=discord.Embed(
-                title="🔒 Bot Locked",
-                description=(
-                    f"The bot is currently locked by the owner.\n\n"
-                    f"**Reason:** {LOCK_REASON}"
-                ),
-                color=discord.Color.red(),
-            )
-        )
+    if lock_state.locked:
+        await ctx.send(embed=lock_state.embed_locked)
         return False
 
     # Role gate
     if REQUIRE_ROLE and not any(role.id == REQUIRED_ROLE_ID for role in ctx.author.roles):
         return False
 
-    # Allow unregistered commands freely
+    # Unregistered-allowed commands bypass registration gate
     if ctx.command and ctx.command.name in UNREGISTERED_ALLOWED:
         return True
 
@@ -130,6 +180,10 @@ async def global_check(ctx: commands.Context) -> bool:
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    # Unwrap CheckFailure silently
+    if isinstance(error, commands.CheckFailure):
+        return
+
     if isinstance(error, commands.CommandOnCooldown):
         embed = error_embed(
             ctx,
@@ -137,13 +191,90 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         )
         msg = await ctx.send(embed=embed)
         await asyncio.sleep(3)
-        await msg.delete()
+        try:
+            await msg.delete()
+        except discord.HTTPException:
+            pass  # Message may have already been deleted
         return
 
-    if isinstance(error, commands.CheckFailure):
+    if isinstance(error, commands.CommandNotFound):
+        return  # Ignore unknown commands silently
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(
+            embed=discord.Embed(
+                title="❌ Missing Argument",
+                description=f"Missing required argument: `{error.param.name}`",
+                color=discord.Color.red(),
+            )
+        )
         return
 
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(
+            embed=discord.Embed(
+                title="❌ Bad Argument",
+                description=str(error),
+                color=discord.Color.red(),
+            )
+        )
+        return
+
+    # Unexpected errors — log with full context
+    log.exception(
+        "Unhandled command error in '%s' (author=%s guild=%s)",
+        ctx.command,
+        ctx.author,
+        ctx.guild,
+        exc_info=error,
+    )
     raise error
+
+
+# ---------------------------------------------------------------------------
+# Cog loader helper
+# ---------------------------------------------------------------------------
+async def _load_cogs() -> tuple[list[str], list[str], list[str]]:
+    """
+    Walk ./cogs, load every .py file as an extension.
+    Returns (success, failed, skipped) extension name lists.
+    """
+    success, failed, skipped = [], [], []
+    loaded: set[str] = set()
+
+    for root, dirs, files in os.walk("./cogs"):
+        # Filter excluded directories in-place so os.walk skips them
+        excluded = [d for d in dirs if d in EXCLUDED_FOLDERS]
+        for d in excluded:
+            folder = os.path.join(root, d).replace("./", "").replace(os.sep, "/")
+            log.info("Cog loader  » Skipped folder  %s", folder)
+            skipped.append(d)
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_FOLDERS]
+
+        for filename in sorted(files):  # sorted for deterministic load order
+            if not filename.endswith(".py") or filename == "__init__.py":
+                continue
+
+            path      = os.path.relpath(os.path.join(root, filename))
+            extension = path.replace(os.sep, ".")[:-3]
+
+            if extension in loaded:
+                log.warning("Cog loader  » Duplicate   %s — skipping", extension)
+                continue
+
+            try:
+                await bot.load_extension(extension)
+                loaded.add(extension)
+                log.info("Cog loader  » Loaded     %s", extension)
+                success.append(extension)
+            except commands.ExtensionAlreadyLoaded:
+                log.warning("Cog loader  » Already loaded %s — skipping", extension)
+                loaded.add(extension)
+            except Exception:
+                log.exception("Cog loader  » Failed     %s", extension)
+                failed.append(extension)
+
+    return success, failed, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +282,10 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready() -> None:
-    global _ready, _started, _start_time
-    if _ready:
+    if state.ready:
         log.warning("on_ready fired again (reconnect) — skipping re-initialisation")
         return
-    _ready = True
+    state.ready = True
 
     await bot.change_presence(
         activity=discord.Activity(
@@ -164,154 +294,166 @@ async def on_ready() -> None:
         )
     )
 
-    log.info("=" * 40)
-    log.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
-    log.info("=" * 40)
+    log.info("=" * 50)
+    log.info("Logged in  » %s  (ID: %s)", bot.user, bot.user.id)
+    log.info("Guilds     » %d", len(bot.guilds))
+    log.info("=" * 50)
 
     # Database
     try:
         await database.connect()
         await run_migrations()
-        log.info("Database    » Connected")
+        log.info("Database   » Connected & migrations applied")
     except Exception:
-        log.exception("Database    » Failed to connect")
-        # Do not proceed to load cogs if DB is broken
+        log.exception("Database   » Failed to initialise — aborting cog load")
         return
 
-    # Load cogs — track loaded extensions to prevent double-loading
-    success, failed, skipped = [], [], []
-    loaded_extensions: set[str] = set()
+    # Load cogs
+    success, failed, skipped = await _load_cogs()
 
-    for root, dirs, files in os.walk("./cogs"):
-        # Filter excluded folders in-place so os.walk won't descend into them
-        for d in list(dirs):
-            if d in EXCLUDED_FOLDERS:
-                folder = os.path.join(root, d).replace("./", "").replace(os.sep, "/")
-                log.info("Cog         » Skipped  %s", folder)
-                skipped.append(d)
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_FOLDERS]
+    # Sync slash commands
+    try:
+        await bot.tree.sync()
+        log.info("Slash cmds » Synced (%d commands)", len(bot.tree.get_commands()))
+    except discord.HTTPException:
+        log.exception("Slash cmds » Sync failed")
 
-        for filename in files:
-            if not filename.endswith(".py") or filename == "__init__.py":
-                continue
-
-            path      = os.path.relpath(os.path.join(root, filename))
-            extension = path.replace(os.sep, ".")[:-3]
-
-            # Guard against the same extension being discovered twice
-            if extension in loaded_extensions:
-                log.warning("Cog         » Duplicate %s — skipping", extension)
-                continue
-
-            try:
-                await bot.load_extension(extension)
-                loaded_extensions.add(extension)
-                log.info("Cog         » Loaded   %s", extension)
-                success.append(extension)
-            except commands.ExtensionAlreadyLoaded:
-                log.warning("Cog         » Already loaded %s — skipping", extension)
-                loaded_extensions.add(extension)
-            except Exception:
-                log.exception("Cog         » Failed   %s", extension)
-                failed.append(extension)
-
-    await bot.tree.sync()
-
-    log.info("=" * 40)
+    log.info("=" * 50)
     log.info(
-        "Cogs        » %d loaded | %d failed | %d skipped",
+        "Cogs       » %d loaded | %d failed | %d skipped",
         len(success), len(failed), len(skipped),
     )
-    log.info("Slash cmds  » Synced")
-    log.info("=" * 40)
+    if failed:
+        log.warning("Failed cogs: %s", ", ".join(failed))
+    log.info("=" * 50)
 
-    _started    = True
-    _start_time = time.monotonic()
+    state.started   = True
+    state.start_time = time.monotonic()
     await send_status(bot, "start")
 
 
 # ---------------------------------------------------------------------------
 # Owner commands
 # ---------------------------------------------------------------------------
-@bot.command()
+@bot.command(hidden=True)
 @commands.is_owner()
 async def sync(ctx: commands.Context) -> None:
+    """Force-sync slash commands and clear the global command tree."""
     bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
-    await ctx.send("Synced and cleared global commands.")
+    synced = await bot.tree.sync()
+    await ctx.send(f"✅ Synced {len(synced)} global command(s).")
 
 
-# bot.py — rename these two owner commands to avoid clashing with /lock in talent cog
-
-@bot.command(name="botlock")          # was: @bot.command()  name="lock"
+@bot.command(name="botlock", hidden=True)
 @commands.is_owner()
 async def botlock(ctx: commands.Context, *, reason: str = "No reason provided.") -> None:
-    global BOT_LOCKED, LOCK_REASON
-    BOT_LOCKED  = True
-    LOCK_REASON = reason
-    await ctx.send(
-        embed=discord.Embed(
-            title="🔒 Bot Locked",
-            description=f"Bot has been locked.\n\n**Reason:** {reason}",
-            color=discord.Color.red(),
-        )
-    )
+    """Lock the bot so only the owner can use it."""
+    lock_state.acquire(reason)
+    await ctx.send(embed=discord.Embed(
+        title="🔒 Bot Locked",
+        description=f"Bot has been locked.\n\n**Reason:** {reason}",
+        color=discord.Color.red(),
+    ))
 
 
-@bot.command(name="botunlock")        # was: @bot.command()  name="unlock"
+@bot.command(name="botunlock", hidden=True)
 @commands.is_owner()
 async def botunlock(ctx: commands.Context) -> None:
-    global BOT_LOCKED, LOCK_REASON
-    BOT_LOCKED  = False
-    LOCK_REASON = ""
-    await ctx.send(
-        embed=discord.Embed(
-            title="🔓 Bot Unlocked",
-            description="Bot is now operational again.",
-            color=discord.Color.green(),
-        )
+    """Unlock the bot for all authorised users."""
+    lock_state.release()
+    await ctx.send(embed=lock_state.embed_unlocked)
+
+
+@bot.command(name="botrestart", hidden=True)
+@commands.is_owner()
+async def botrestart(ctx: commands.Context, *, reason: str = "Manual restart by owner.") -> None:
+    """Gracefully restart the bot by re-executing the current process."""
+    await ctx.send(embed=discord.Embed(
+        title="🔄 Restarting Bot",
+        description=f"Bot is restarting...\n\n**Reason:** {reason}",
+        color=discord.Color.orange(),
+    ))
+    log.info("Restart requested by owner. Reason: %s", reason)
+
+    try:
+        await send_status(bot, "stop")
+    except Exception:
+        log.exception("Failed to send pre-restart status")
+    try:
+        await database.disconnect()
+        log.info("Database   » Disconnected cleanly before restart")
+    except Exception:
+        log.exception("Error during database disconnect before restart")
+
+    await bot.close()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+@bot.command(name="botstatus", hidden=True)
+@commands.is_owner()
+async def botstatus(ctx: commands.Context) -> None:
+    """Display current runtime stats."""
+    uptime = (
+        f"{time.monotonic() - state.start_time:.0f}s"
+        if state.start_time else "N/A"
     )
+    embed = discord.Embed(title="📊 Bot Status", color=discord.Color.blurple())
+    embed.add_field(name="Uptime",   value=uptime,             inline=True)
+    embed.add_field(name="Guilds",   value=len(bot.guilds),    inline=True)
+    embed.add_field(name="Locked",   value=str(lock_state.locked), inline=True)
+    embed.add_field(name="Cogs",     value=len(bot.cogs),      inline=True)
+    embed.add_field(name="Commands", value=len(bot.commands),  inline=True)
+    await ctx.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
 # Shutdown helpers
 # ---------------------------------------------------------------------------
 async def _shutdown() -> None:
-    log.info("Shutting down...")
+    log.info("Shutdown sequence initiated...")
     try:
         await send_status(bot, "stop")
     except Exception:
         log.exception("Failed to send shutdown status")
     try:
         await database.disconnect()
+        log.info("Database   » Disconnected cleanly")
     except Exception:
-        log.exception("Error during shutdown cleanup")
+        log.exception("Error during database disconnect")
     await bot.close()
+    log.info("Bot        » Closed")
 
 
-def _handle_signal(signum, _frame) -> None:
-    global _shutdown_triggered
-    if _shutdown_triggered:
+def _handle_signal(signum: int, _frame) -> None:
+    if state.shutdown_triggered:
         return
-    _shutdown_triggered = True
-    log.info("Received signal %s", signal.Signals(signum).name)
-    asyncio.get_running_loop().create_task(_shutdown())
+    state.shutdown_triggered = True
+    log.info("Signal received: %s — initiating graceful shutdown", signal.Signals(signum).name)
+    loop = asyncio.get_running_loop()
+    loop.create_task(_shutdown())
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 async def main() -> None:
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _handle_signal)
 
     try:
         async with bot:
             await bot.start(TOKEN)
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Interrupted — shutting down")
     except Exception:
-        log.exception("Bot crashed")
-        await send_status(bot, "crash")
+        log.exception("Bot crashed unexpectedly")
+        try:
+            await send_status(bot, "crash")
+        except Exception:
+            log.exception("Failed to send crash status")
         raise
+    finally:
+        log.info("Process exiting")
 
 
 if __name__ == "__main__":

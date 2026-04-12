@@ -2,16 +2,46 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Final, TypedDict
 
 import discord
 from discord.ext import commands
 
 log = logging.getLogger("bot.story.intro")
 
-SCENE_TIMEOUT    = int(os.getenv("SCENE_TIMEOUT", "30"))
-STORY_BANNER_URL = os.getenv("STORY_BANNER_URL", "")
+SCENE_TIMEOUT:    Final[int] = int(os.getenv("SCENE_TIMEOUT", "30"))
+STORY_BANNER_URL: Final[str] = os.getenv("STORY_BANNER_URL", "")
 
-SCENES = [
+_DIVIDER: Final[str] = "――――――――――――――――――――"
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+class Choice(TypedDict):
+    label: str
+    score: int
+    response: str
+
+
+class Scene(TypedDict):
+    title: str
+    description: str
+    choices: list[Choice]
+
+
+class Outcome(TypedDict):
+    title: str
+    color: discord.Color
+    description: str
+
+
+# ---------------------------------------------------------------------------
+# Scene & outcome data
+# ---------------------------------------------------------------------------
+
+SCENES: Final[list[Scene]] = [
     {
         "title": "Scene 1 — The Forgotten Scroll",
         "description": (
@@ -20,7 +50,7 @@ SCENES = [
             "half-buried in the dirt. An inner disciple is watching from a distance."
         ),
         "choices": [
-            {"label": "📜 Study the scroll in secret",   "score": 2, "response": "Your eyes trace the ancient characters hungrily. A faint warmth stirs in your chest — Qi, reacting to your intent."},
+            {"label": "📜 Study the scroll in secret",    "score": 2, "response": "Your eyes trace the ancient characters hungrily. A faint warmth stirs in your chest — Qi, reacting to your intent."},
             {"label": "🙇 Hand it to the inner disciple", "score": 0, "response": "The disciple takes it without a word. He doesn't even glance back. You feel nothing but the cold wind."},
         ],
     },
@@ -31,7 +61,7 @@ SCENES = [
             "His robes bear the sect's crest. He whispers he was ambushed — and that he carries a **Qi-gathering jade**."
         ),
         "choices": [
-            {"label": "🩹 Help him back to the sect",  "score": 2, "response": "You bear his weight for three miles. Before losing consciousness he presses something cold into your palm — the jade."},
+            {"label": "🩹 Help him back to the sect",   "score": 2, "response": "You bear his weight for three miles. Before losing consciousness he presses something cold into your palm — the jade."},
             {"label": "👁️ Leave him and take the jade", "score": 0, "response": "Your fingers close around the jade. It feels heavy — not just in weight. His fading eyes say everything."},
         ],
     },
@@ -44,7 +74,7 @@ SCENES = [
         ),
         "choices": [
             {"label": "🔥 Meditate overnight and try again at dawn", "score": 2, "response": "Hours pass. Pain. Stillness. Then — a crack of light in the stone. The gate shudders and opens an inch."},
-            {"label": "💰 Bribe another examiner to falsify results",  "score": 0, "response": "The coins exchange hands. You step through. But you feel it — the Dao does not lie to itself."},
+            {"label": "💰 Bribe another examiner to falsify results", "score": 0, "response": "The coins exchange hands. You step through. But you feel it — the Dao does not lie to itself."},
         ],
     },
     {
@@ -73,7 +103,7 @@ SCENES = [
     },
 ]
 
-OUTCOMES = {
+OUTCOMES: Final[dict[str, Outcome]] = {
     "pass": {
         "title": "⚡ The Dao Opens Before You",
         "color": discord.Color.gold(),
@@ -106,13 +136,26 @@ OUTCOMES = {
     },
 }
 
+# Pre-computed for efficiency — score required to reach each outcome.
+_MAX_SCORE: Final[int]  = sum(max(c["score"] for c in s["choices"]) for s in SCENES)
+_PASS_THRESHOLD: Final[int]  = _MAX_SCORE          # all correct
+_RETRY_THRESHOLD: Final[int] = _MAX_SCORE // 2 + 1  # majority correct
 
-def _build_scene_embed(
-    ctx: commands.Context,
-    scene_index: int,
-    description: str,
-) -> discord.Embed:
-    """Build a consistent scene embed with banner image as footer."""
+
+def resolve_outcome(score: int) -> Outcome:
+    """Return the correct :data:`OUTCOMES` entry for a final *score*."""
+    if score >= _PASS_THRESHOLD:
+        return OUTCOMES["pass"]
+    if score >= _RETRY_THRESHOLD:
+        return OUTCOMES["retry"]
+    return OUTCOMES["fail"]
+
+
+# ---------------------------------------------------------------------------
+# Embed builder
+# ---------------------------------------------------------------------------
+
+def _build_scene_embed(ctx: commands.Context, scene_index: int, description: str) -> discord.Embed:
     scene = SCENES[scene_index]
     embed = discord.Embed(
         title=scene["title"],
@@ -120,13 +163,21 @@ def _build_scene_embed(
         color=discord.Color.dark_teal(),
     )
     embed.set_footer(
-        text=f"Scene {scene_index + 1} of {len(SCENES)}  •  {ctx.author.display_name}  •  You have {SCENE_TIMEOUT}s to choose",
+        text=(
+            f"Scene {scene_index + 1} of {len(SCENES)}  •  "
+            f"{ctx.author.display_name}  •  "
+            f"You have {SCENE_TIMEOUT}s to choose"
+        ),
         icon_url=ctx.author.display_avatar.url,
     )
     if STORY_BANNER_URL:
         embed.set_image(url=STORY_BANNER_URL)
     return embed
 
+
+# ---------------------------------------------------------------------------
+# Scene view
+# ---------------------------------------------------------------------------
 
 class SceneView(discord.ui.View):
     def __init__(
@@ -135,13 +186,13 @@ class SceneView(discord.ui.View):
         ctx: commands.Context,
         scene_index: int,
         score: int,
-    ):
+    ) -> None:
         super().__init__(timeout=SCENE_TIMEOUT)
-        self.cog        = cog
-        self.ctx        = ctx
+        self.cog         = cog
+        self.ctx         = ctx
         self.scene_index = scene_index
-        self.score      = score
-        self._timed_out = False
+        self.score       = score
+        self._timed_out  = False
 
         for i, choice in enumerate(SCENES[scene_index]["choices"]):
             btn          = discord.ui.Button(
@@ -152,54 +203,65 @@ class SceneView(discord.ui.View):
             btn.callback = self._make_callback(i)
             self.add_item(btn)
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+
     def _make_callback(self, choice_index: int):
-        async def callback(interaction: discord.Interaction):
+        async def callback(interaction: discord.Interaction) -> None:
             if interaction.user.id != self.ctx.author.id:
                 await interaction.response.send_message(
                     "This isn't your journey.", ephemeral=True
                 )
                 return
 
-            # Disable all buttons immediately to prevent double-clicks
+            # Prevent double-clicks before any async work
             self.stop()
-            for item in self.children:
-                item.disabled = True
+            self._disable_all()
 
-            choice    = SCENES[self.scene_index]["choices"][choice_index]
-            new_score = self.score + choice["score"]
+            choice     = SCENES[self.scene_index]["choices"][choice_index]
+            new_score  = self.score + choice["score"]
             next_index = self.scene_index + 1
 
             if next_index < len(SCENES):
                 next_scene  = SCENES[next_index]
                 description = (
                     f"*{choice['response']}*\n\n"
-                    f"――――――――――――――――――――\n\n"
+                    f"{_DIVIDER}\n\n"
                     f"{next_scene['description']}"
                 )
-                embed    = _build_scene_embed(self.ctx, next_index, description)
-                next_view = SceneView(self.cog, self.ctx, next_index, new_score)
+                embed      = _build_scene_embed(self.ctx, next_index, description)
+                next_view  = SceneView(self.cog, self.ctx, next_index, new_score)
                 await interaction.response.edit_message(embed=embed, view=next_view)
                 log.debug(
-                    "Story » %s scene %d→%d score=%d",
-                    self.ctx.author, self.scene_index + 1, next_index + 1, new_score,
+                    "Story » %s  scene %d→%d  score=%d",
+                    self.ctx.author,
+                    self.scene_index + 1,
+                    next_index + 1,
+                    new_score,
                 )
             else:
                 await self.cog.send_outcome(self.ctx, new_score, interaction)
 
         return callback
 
+    # ------------------------------------------------------------------
+    # Timeout
+    # ------------------------------------------------------------------
+
     async def on_timeout(self) -> None:
         if self._timed_out:
             return
         self._timed_out = True
 
-        # Remove the user from active set so they can retry
         self.cog.active_users.discard(self.ctx.author.id)
+        self._disable_all()
 
-        for item in self.children:
-            item.disabled = True
-
-        timeout_embed = discord.Embed(
+        embed = discord.Embed(
             title="⌛ The Trial Has Expired",
             description=(
                 "You stood motionless before the heavens, and the heavens moved on.\n\n"
@@ -209,8 +271,8 @@ class SceneView(discord.ui.View):
             color=discord.Color.dark_gray(),
         )
         if STORY_BANNER_URL:
-            timeout_embed.set_image(url=STORY_BANNER_URL)
-        timeout_embed.set_footer(
+            embed.set_image(url=STORY_BANNER_URL)
+        embed.set_footer(
             text=f"{self.ctx.author.display_name} • Trial Abandoned",
             icon_url=self.ctx.author.display_avatar.url,
         )
@@ -218,7 +280,6 @@ class SceneView(discord.ui.View):
         log.info("Story » %s timed out on scene %d", self.ctx.author, self.scene_index + 1)
 
         try:
-            # Edit the original message to show timeout
-            await self.message.edit(embed=timeout_embed, view=self)
+            await self.message.edit(embed=embed, view=self)
         except discord.HTTPException:
             pass

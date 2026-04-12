@@ -61,34 +61,45 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from typing import Any, Callable, Coroutine, TypeVar
+from typing import Any, Callable, Coroutine, Final, TypeVar
 
 import discord
 
 log = logging.getLogger("bot.ui.interaction_utils")
 
 # ---------------------------------------------------------------------------
-# Error classification
+# Constants
 # ---------------------------------------------------------------------------
 
 # Discord REST error codes we treat as "stale / already handled"
-_STALE_CODES: frozenset[int] = frozenset({
+_STALE_CODES: Final[frozenset[int]] = frozenset({
     10062,  # Unknown Interaction  – window expired or double-ack
     10015,  # Unknown Webhook      – followup webhook gone
-    40060,  # Interaction already acknowledged (sometimes returned instead of raising InteractionResponded)
+    40060,  # Interaction already acknowledged
 })
 
 # HTTP status codes worth a single transparent retry
-_RETRY_STATUS: frozenset[int] = frozenset({500, 502, 503, 504})
+_RETRY_STATUS: Final[frozenset[int]] = frozenset({500, 502, 503, 504})
 
-# How long to wait before the one automatic retry (seconds)
-_RETRY_DELAY: float = 0.4
+# Seconds to wait before the one automatic retry
+_RETRY_DELAY: Final[float] = 0.4
 
+# Generic error embed shown to the user when an unhandled exception occurs
+_ERROR_EMBED: Final = discord.Embed(
+    title="Something went wrong",
+    description=(
+        "An unexpected error occurred. "
+        "Please try again or contact a server admin if it persists."
+    ),
+    color=discord.Color.red(),
+)
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
 
 def _is_stale(exc: Exception) -> bool:
     """Return ``True`` when *exc* is a known stale/duplicate interaction error."""
-    if isinstance(exc, discord.NotFound) and exc.code in _STALE_CODES:
-        return True
     if isinstance(exc, discord.InteractionResponded):
         return True
     if isinstance(exc, discord.HTTPException) and exc.code in _STALE_CODES:
@@ -100,9 +111,32 @@ def _is_retryable(exc: Exception) -> bool:
     """Return ``True`` when *exc* is a transient error worth one retry."""
     if isinstance(exc, discord.HTTPException) and exc.status in _RETRY_STATUS:
         return True
-    if isinstance(exc, (asyncio.TimeoutError,)):
+    if isinstance(exc, asyncio.TimeoutError):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers — avoid repeating the same format string everywhere
+# ---------------------------------------------------------------------------
+
+def _log_stale(fn_name: str, interaction: discord.Interaction, exc: Exception) -> None:
+    log.debug(
+        "%s: stale interaction suppressed  id=%s  user=%s  error=%s",
+        fn_name,
+        interaction.id,
+        getattr(interaction.user, "id", "?"),
+        exc,
+    )
+
+
+def _log_unexpected(fn_name: str, interaction: discord.Interaction) -> None:
+    log.exception(
+        "%s: unexpected error  id=%s  user=%s",
+        fn_name,
+        interaction.id,
+        getattr(interaction.user, "id", "?"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,11 +151,11 @@ async def _call_with_retry(coro_factory: Callable[[], Coroutine[Any, Any, Any]])
     try:
         return await coro_factory()
     except Exception as exc:
-        if _is_retryable(exc):
-            log.warning("interaction_utils: transient error, retrying once – %s", exc)
-            await asyncio.sleep(_RETRY_DELAY)
-            return await coro_factory()
-        raise
+        if not _is_retryable(exc):
+            raise
+        log.warning("interaction_utils: transient error, retrying once – %s", exc)
+        await asyncio.sleep(_RETRY_DELAY)
+        return await coro_factory()
 
 
 # ---------------------------------------------------------------------------
@@ -150,11 +184,9 @@ async def safe_defer(
     -------
     bool
         ``True`` if the defer succeeded.
-        ``False`` if the interaction was already acknowledged or had expired
-        (the caller may use this to skip follow-up edits).
+        ``False`` if the interaction was already acknowledged or had expired.
     """
     if interaction.response.is_done():
-        # Already acknowledged – nothing to do, and that's fine
         log.debug("safe_defer: interaction already done  id=%s", interaction.id)
         return False
 
@@ -165,19 +197,9 @@ async def safe_defer(
         return True
     except Exception as exc:
         if _is_stale(exc):
-            log.debug(
-                "safe_defer: stale interaction suppressed  id=%s  user=%s  error=%s",
-                interaction.id,
-                getattr(interaction.user, "id", "?"),
-                exc,
-            )
+            _log_stale("safe_defer", interaction, exc)
             return False
-        # Unexpected error – log it but don't crash the bot
-        log.exception(
-            "safe_defer: unexpected error  id=%s  user=%s",
-            interaction.id,
-            getattr(interaction.user, "id", "?"),
-        )
+        _log_unexpected("safe_defer", interaction)
         return False
 
 
@@ -221,18 +243,9 @@ async def safe_send(
         return True
     except Exception as exc:
         if _is_stale(exc):
-            log.debug(
-                "safe_send: stale interaction suppressed  id=%s  user=%s  error=%s",
-                interaction.id,
-                getattr(interaction.user, "id", "?"),
-                exc,
-            )
+            _log_stale("safe_send", interaction, exc)
             return False
-        log.exception(
-            "safe_send: unexpected error  id=%s  user=%s",
-            interaction.id,
-            getattr(interaction.user, "id", "?"),
-        )
+        _log_unexpected("safe_send", interaction)
         return False
 
 
@@ -274,12 +287,17 @@ async def safe_edit(
     bool
         ``True`` on success, ``False`` if the interaction had expired.
     """
-    edit_kwargs: dict[str, Any] = {}
-    if content     is not discord.utils.MISSING: edit_kwargs["content"]     = content
-    if embed       is not discord.utils.MISSING: edit_kwargs["embed"]       = embed
-    if embeds      is not discord.utils.MISSING: edit_kwargs["embeds"]      = embeds
-    if view        is not discord.utils.MISSING: edit_kwargs["view"]        = view
-    if attachments is not discord.utils.MISSING: edit_kwargs["attachments"] = attachments
+    _MISSING = discord.utils.MISSING
+    edit_kwargs: dict[str, Any] = {
+        k: v for k, v in {
+            "content":     content,
+            "embed":       embed,
+            "embeds":      embeds,
+            "view":        view,
+            "attachments": attachments,
+        }.items()
+        if v is not _MISSING
+    }
     edit_kwargs.update(kwargs)
 
     try:
@@ -289,18 +307,9 @@ async def safe_edit(
         return True
     except Exception as exc:
         if _is_stale(exc):
-            log.debug(
-                "safe_edit: stale interaction suppressed  id=%s  user=%s  error=%s",
-                interaction.id,
-                getattr(interaction.user, "id", "?"),
-                exc,
-            )
+            _log_stale("safe_edit", interaction, exc)
             return False
-        log.exception(
-            "safe_edit: unexpected error  id=%s  user=%s",
-            interaction.id,
-            getattr(interaction.user, "id", "?"),
-        )
+        _log_unexpected("safe_edit", interaction)
         return False
 
 
@@ -312,12 +321,6 @@ async def safe_respond_or_followup(
 ) -> bool:
     """
     Unified helper: respond if fresh, followup if already deferred/responded.
-
-    This is the recommended drop-in for the common pattern::
-
-        await interaction.response.defer(ephemeral=True)
-        # ... work ...
-        await interaction.followup.send(embed=..., ephemeral=True)
 
     Parameters
     ----------
@@ -346,18 +349,9 @@ async def safe_respond_or_followup(
         return True
     except Exception as exc:
         if _is_stale(exc):
-            log.debug(
-                "safe_respond_or_followup: stale interaction suppressed  id=%s  user=%s  error=%s",
-                interaction.id,
-                getattr(interaction.user, "id", "?"),
-                exc,
-            )
+            _log_stale("safe_respond_or_followup", interaction, exc)
             return False
-        log.exception(
-            "safe_respond_or_followup: unexpected error  id=%s  user=%s",
-            interaction.id,
-            getattr(interaction.user, "id", "?"),
-        )
+        _log_unexpected("safe_respond_or_followup", interaction)
         return False
 
 
@@ -374,23 +368,17 @@ async def safe_delete_original(interaction: discord.Interaction) -> bool:
     try:
         await _call_with_retry(interaction.delete_original_response)
         return True
+    except discord.NotFound as exc:
+        if _is_stale(exc):
+            _log_stale("safe_delete_original", interaction, exc)
+        else:
+            log.debug("safe_delete_original: message already deleted  id=%s", interaction.id)
+        return False
     except Exception as exc:
         if _is_stale(exc):
-            log.debug(
-                "safe_delete_original: stale interaction suppressed  id=%s  user=%s",
-                interaction.id,
-                getattr(interaction.user, "id", "?"),
-            )
+            _log_stale("safe_delete_original", interaction, exc)
             return False
-        if isinstance(exc, discord.NotFound):
-            # Message already gone – not an error worth raising
-            log.debug("safe_delete_original: message already deleted  id=%s", interaction.id)
-            return False
-        log.exception(
-            "safe_delete_original: unexpected error  id=%s  user=%s",
-            interaction.id,
-            getattr(interaction.user, "id", "?"),
-        )
+        _log_unexpected("safe_delete_original", interaction)
         return False
 
 
@@ -399,6 +387,17 @@ async def safe_delete_original(interaction: discord.Interaction) -> bool:
 # ---------------------------------------------------------------------------
 
 F = TypeVar("F", bound=Callable[..., Coroutine[Any, Any, Any]])
+
+
+def _find_interaction(*args: Any, **kwargs: Any) -> discord.Interaction | None:
+    """Locate the first :class:`discord.Interaction` in a function's arguments."""
+    for arg in args:
+        if isinstance(arg, discord.Interaction):
+            return arg
+    for val in kwargs.values():
+        if isinstance(val, discord.Interaction):
+            return val
+    return None
 
 
 def interaction_handler(
@@ -442,17 +441,7 @@ def interaction_handler(
     def decorator(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> None:
-            # Locate the interaction argument (first discord.Interaction found)
-            interaction: discord.Interaction | None = None
-            for arg in args:
-                if isinstance(arg, discord.Interaction):
-                    interaction = arg
-                    break
-            if interaction is None:
-                for v in kwargs.values():
-                    if isinstance(v, discord.Interaction):
-                        interaction = v
-                        break
+            interaction = _find_interaction(*args, **kwargs)
 
             if interaction is not None and auto_defer:
                 await safe_defer(interaction, ephemeral=ephemeral, thinking=thinking)
@@ -474,19 +463,10 @@ def interaction_handler(
                     getattr(interaction, "id", "?"),
                 )
 
-                # Try to tell the user something went wrong
                 if interaction is not None:
-                    error_embed = discord.Embed(
-                        title="Something went wrong",
-                        description=(
-                            "An unexpected error occurred. "
-                            "Please try again or contact a server admin if it persists."
-                        ),
-                        color=discord.Color.red(),
-                    )
                     await safe_respond_or_followup(
                         interaction,
-                        embed=error_embed,
+                        embed=_ERROR_EMBED,
                         ephemeral=True,
                     )
 

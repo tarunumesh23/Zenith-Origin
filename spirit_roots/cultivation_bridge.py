@@ -13,48 +13,48 @@ from __future__ import annotations
 # Per-tier bonus tables
 # ---------------------------------------------------------------------------
 # Each root tier value (1–5) maps to additive bonuses on top of the identity.
-# These stack with talent bonuses (after merging) and respect the same hard caps.
+# These stack with talent bonuses via merge_bonuses() and respect hard caps.
 
 _ROOT_BONUSES: dict[int, dict[str, float]] = {
     1: {  # Mortal Root — essentially no bonus
-        "qi_multiplier":         1.00,
-        "breakthrough_bonus":    0.0,
-        "overflow_chance":       0.00,
-        "negate_qi_loss_chance": 0.00,
-        "meditate_cooldown_mult":1.00,
-        "qi_threshold_bonus":    0.00,
+        "qi_multiplier":          1.00,
+        "breakthrough_bonus":     0.0,
+        "overflow_chance":        0.00,
+        "negate_qi_loss_chance":  0.00,
+        "meditate_cooldown_mult": 1.00,
+        "qi_threshold_bonus":     0.00,
     },
     2: {  # Iron Root — slight Qi tick boost
-        "qi_multiplier":         1.05,
-        "breakthrough_bonus":    0.0,
-        "overflow_chance":       0.00,
-        "negate_qi_loss_chance": 0.00,
-        "meditate_cooldown_mult":1.00,
-        "qi_threshold_bonus":    0.00,
+        "qi_multiplier":          1.05,
+        "breakthrough_bonus":     0.0,
+        "overflow_chance":        0.00,
+        "negate_qi_loss_chance":  0.00,
+        "meditate_cooldown_mult": 1.00,
+        "qi_threshold_bonus":     0.00,
     },
     3: {  # Jade Root — meaningful Qi boost + small breakthrough help
-        "qi_multiplier":         1.12,
-        "breakthrough_bonus":    2.0,
-        "overflow_chance":       0.01,
-        "negate_qi_loss_chance": 0.05,
-        "meditate_cooldown_mult":0.95,
-        "qi_threshold_bonus":    0.05,
+        "qi_multiplier":          1.12,
+        "breakthrough_bonus":     2.0,
+        "overflow_chance":        0.01,
+        "negate_qi_loss_chance":  0.05,
+        "meditate_cooldown_mult": 0.95,
+        "qi_threshold_bonus":     0.05,
     },
     4: {  # Golden Root — strong across the board
-        "qi_multiplier":         1.25,
-        "breakthrough_bonus":    5.0,
-        "overflow_chance":       0.03,
-        "negate_qi_loss_chance": 0.12,
-        "meditate_cooldown_mult":0.85,
-        "qi_threshold_bonus":    0.10,
+        "qi_multiplier":          1.25,
+        "breakthrough_bonus":     5.0,
+        "overflow_chance":        0.03,
+        "negate_qi_loss_chance":  0.12,
+        "meditate_cooldown_mult": 0.85,
+        "qi_threshold_bonus":     0.10,
     },
     5: {  # Heavenly Root — exceptional
-        "qi_multiplier":         1.50,
-        "breakthrough_bonus":   10.0,
-        "overflow_chance":       0.07,
-        "negate_qi_loss_chance": 0.25,
-        "meditate_cooldown_mult":0.70,
-        "qi_threshold_bonus":    0.20,
+        "qi_multiplier":          1.50,
+        "breakthrough_bonus":    10.0,
+        "overflow_chance":        0.07,
+        "negate_qi_loss_chance":  0.25,
+        "meditate_cooldown_mult": 0.70,
+        "qi_threshold_bonus":     0.20,
     },
 }
 
@@ -64,7 +64,7 @@ _CAPS: dict[str, float] = {
     "breakthrough_bonus":    20.00,
     "overflow_chance":        0.30,
     "negate_qi_loss_chance":  0.75,
-    "meditate_cooldown_mult": 0.40,
+    "meditate_cooldown_mult": 0.40,   # lower is better; this is a floor, not a ceiling
     "qi_threshold_bonus":     0.50,
 }
 
@@ -125,42 +125,45 @@ def describe_spirit_root_bonuses(root_value: int | None) -> str:
 
 def merge_bonuses(
     talent_bonuses: dict[str, float],
-    root_bonuses: dict[str, float],
+    root_bonuses:   dict[str, float],
 ) -> dict[str, float]:
     """
-    Additively merge talent and Spirit Root bonus dicts, then apply hard caps.
+    Merge talent and Spirit Root bonus dicts, then apply hard caps.
 
-    For multipliers (qi_multiplier, meditate_cooldown_mult) the values are
-    multiplied together rather than added so that each source scales cleanly.
-    For the meditate cooldown mult, we want LOWER = better, so we multiply
-    (e.g. 0.85 talent × 0.90 root = 0.765 combined).
+    Merging rules
+    -------------
+    ``qi_multiplier``
+        True multiplicative: ``talent × root``.
+        Both values are already ≥ 1.0 (identity = 1.0), so multiplying them
+        gives correct compounding — e.g. ×1.25 talent × ×1.12 root = ×1.40.
+
+    ``meditate_cooldown_mult``
+        Also multiplicative — lower is better, so the values compound as
+        reductions: 0.85 × 0.95 = 0.8075 (≈19% shorter total cooldown).
+        Capped at ``_CAPS["meditate_cooldown_mult"]`` as a *floor* (``max``).
+
+    All other keys
+        Simple additive.  Capped at ``_CAPS[key]`` as a ceiling (``min``).
     """
     merged: dict[str, float] = {}
 
     for key in _IDENTITY:
         t = talent_bonuses.get(key, _IDENTITY[key])
-        r = root_bonuses.get(key, _IDENTITY[key])
+        r = root_bonuses.get(key,   _IDENTITY[key])
 
-        if key == "qi_multiplier":
-            # Multiplicative — e.g. ×1.25 talent × ×1.12 root = ×1.40
-            # Both start at 1.0 identity, so subtract 1 from each bonus then add together
-            # to avoid double-counting the base:  1 + (t-1) + (r-1)
-            merged[key] = 1.0 + (t - 1.0) + (r - 1.0)
-
-        elif key == "meditate_cooldown_mult":
-            # Multiplicative reduction — lower is better
+        if key in ("qi_multiplier", "meditate_cooldown_mult"):
+            # Both sources are expressed as multipliers with identity = their
+            # respective neutral values (1.0 for both here), so straight
+            # multiplication is the correct compounding operation.
             merged[key] = t * r
-
         else:
-            # Simple additive
             merged[key] = t + r
 
-    # Apply hard caps
-    merged["qi_multiplier"]          = min(merged["qi_multiplier"],          _CAPS["qi_multiplier"])
-    merged["breakthrough_bonus"]     = min(merged["breakthrough_bonus"],      _CAPS["breakthrough_bonus"])
-    merged["overflow_chance"]        = min(merged["overflow_chance"],         _CAPS["overflow_chance"])
-    merged["negate_qi_loss_chance"]  = min(merged["negate_qi_loss_chance"],   _CAPS["negate_qi_loss_chance"])
-    merged["meditate_cooldown_mult"] = max(merged["meditate_cooldown_mult"],  _CAPS["meditate_cooldown_mult"])
-    merged["qi_threshold_bonus"]     = min(merged["qi_threshold_bonus"],      _CAPS["qi_threshold_bonus"])
+    # Apply caps — ceiling for most stats, floor for cooldown reduction.
+    for key, cap in _CAPS.items():
+        if key == "meditate_cooldown_mult":
+            merged[key] = max(merged[key], cap)   # lower is better → floor
+        else:
+            merged[key] = min(merged[key], cap)   # higher is better → ceiling
 
     return merged

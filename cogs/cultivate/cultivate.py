@@ -164,6 +164,7 @@ def _build_qi_embed(
     bonuses: dict[str, float],
     active_talent: PlayerTalent | None = None,
 ) -> discord.Embed:
+
     base_threshold     = row["qi_threshold"]
     expanded_threshold = int(base_threshold * (1.0 + bonuses["qi_threshold_bonus"]))
 
@@ -176,30 +177,35 @@ def _build_qi_embed(
         talent_multiplier=bonuses["qi_multiplier"],
         now=now,
     )
-    current_qi   = int(current_qi)
-    affinity     = row.get("affinity")
-    in_trib      = row.get("in_tribulation", False)
+
+    current_qi = int(current_qi)
+    affinity   = row.get("affinity")
+    in_trib    = row.get("in_tribulation", False)
     closed_until = row.get("closed_cult_until")
 
+    # ── Progress Bar ─────────────────────────────
     pct    = min(current_qi / base_threshold, 1.0) if base_threshold else 0.0
     filled = int(pct * 20)
     bar    = "█" * filled + "░" * (20 - filled)
 
+    # ── Time to Fill ─────────────────────────────
     qi_remaining = max(0, base_threshold - current_qi)
+
     if in_trib:
-        ttf_str = "⚡ **Tribulation ready — use `/breakthrough`!**"
+        ttf_str = "⚡ Ready for breakthrough"
     elif qi_remaining == 0:
         ttf_str = "Full"
     elif rate > 0:
-        h, rem   = divmod(int(qi_remaining / rate), 3600)
-        m, s     = divmod(rem, 60)
-        parts    = ([f"{h}h"] if h else []) + ([f"{m}m"] if m else []) + ([f"{s}s"] if s else [])
-        ttf_str  = " ".join(parts) or "< 1s"
+        h, rem = divmod(int(qi_remaining / rate), 3600)
+        m, s   = divmod(rem, 60)
+        parts  = ([f"{h}h"] if h else []) + ([f"{m}m"] if m else []) + ([f"{s}s"] if s else [])
+        ttf_str = " ".join(parts) or "<1s"
     else:
         ttf_str = "—"
 
+    # ── Status Strings ───────────────────────────
     cc_str = (
-        f"Active — ends <t:{int(_as_utc(closed_until).timestamp())}:R>"
+        f"🟣 Active — <t:{int(_as_utc(closed_until).timestamp())}:R>"
         if closed_until and _as_utc(closed_until) > now
         else "Inactive"
     )
@@ -207,35 +213,35 @@ def _build_qi_embed(
     affinity_label = AFFINITY_DISPLAY.get(affinity, affinity.title()) if affinity else "Not chosen"
     realm_label    = REALM_DISPLAY.get(row["realm"], row["realm"])
 
+    # ── Talent ───────────────────────────────────
     if active_talent is None:
-        talent_line = "\n**Talent:** *None*"
+        talent_block = "**Talent:** None"
     else:
         from talent.constants import RARITIES
-        rarity_data  = RARITIES.get(active_talent.rarity, {})
-        t_emoji      = rarity_data.get("emoji", "")
-        stage_label  = ["", " ✦", " ✦✦"][active_talent.evolution_stage]
-        talent_line  = (
-            f"\n**Talent:** {t_emoji} {active_talent.name}{stage_label} "
+        rarity_data = RARITIES.get(active_talent.rarity, {})
+        emoji = rarity_data.get("emoji", "")
+        stage = ["", " ✦", " ✦✦"][active_talent.evolution_stage]
+
+        talent_block = (
+            f"**Talent:** {emoji} {active_talent.name}{stage} "
             f"[{active_talent.rarity}] ×{active_talent.multiplier:.2f}"
         )
-        bonus_parts = []
-        if bonuses["qi_multiplier"] > 1.0:
-            bonus_parts.append(f"Qi ×{bonuses['qi_multiplier']:.2f}")
-        if bonuses["qi_threshold_bonus"] > 0:
-            bonus_parts.append(f"Threshold +{bonuses['qi_threshold_bonus']*100:.0f}%")
-        if bonus_parts:
-            talent_line += f" ({', '.join(bonus_parts)})"
 
+    # ── Description Layout (CLEAN) ───────────────
     desc = (
-        f"**Realm:** {realm_label} — Stage {row['stage']}\n"
-        f"**Affinity:** {affinity_label}\n\n"
-        f"`{bar}` **{pct * 100:.1f}%**\n"
-        f"**Qi:** `{current_qi:,} / {base_threshold:,}`\n"
-        f"**Qi/sec:** `{rate:.3f}`\n"
-        f"**Time to fill:** {ttf_str}\n\n"
-        f"**Closed Cultivation:** {cc_str}\n"
-        f"**Tribulation:** {'⚡ Pending — use `/breakthrough`!' if in_trib else 'Not yet'}"
-        f"{talent_line}\n\n"
+        f"**🧬 Realm:** {realm_label} — Stage {row['stage']}\n"
+        f"**🌿 Affinity:** {affinity_label}\n\n"
+
+        f"`{bar}` **{pct*100:.1f}%**\n"
+        f"**Qi:** `{current_qi:,} / {base_threshold:,}`\n\n"
+
+        f"**⚡ Qi/sec:** `{rate:.3f}`\n"
+        f"**⏳ Time to Full:** {ttf_str}\n\n"
+
+        f"**🧘 Closed Cultivation:** {cc_str}\n"
+        f"**⚠️ Tribulation:** {'Pending' if in_trib else 'Stable'}\n\n"
+
+        f"{talent_block}\n\n"
         f"-# Updates every {QI_LIVE_UPDATE_INTERVAL}s"
     )
 
@@ -245,9 +251,10 @@ def _build_qi_embed(
         "display_name",
         "Cultivator",
     )
+
     return build_embed(
         ctx_or_interaction,
-        title=f"🔮 {display_name}'s Qi Status",
+        title=f"🔮 {display_name}'s Qi",
         description=desc,
         color=discord.Color.blurple(),
         show_footer=True,
@@ -413,7 +420,7 @@ class Cultivate(commands.Cog):
             cd_note = ""
 
         desc = (
-            f"You sink into stillness. The world fades.\n\n"
+            f"You enter a state of deep meditation, drawing in the surrounding Qi.\n\n"
             f"**+{qi_gain} Qi** absorbed.\n"
             f"Current Qi: `{updated['qi']:,} / {updated['qi_threshold']:,}`"
             f"{cd_note}"
@@ -505,7 +512,7 @@ class Cultivate(commands.Cog):
                 ctx,
                 title="🔒 Closed Cultivation Begun",
                 description=(
-                    "You seal yourself away from the world.\n\n"
+                    "You enter seclusion, cutting yourself off from the outside world.\n\n"
                     "**2× Qi rate** for the next **4 hours**.\n"
                     "⚠️ Using **any command** will **break your seclusion** and cancel the bonus.\n"
                     "⚠️ You are **vulnerable to ambush** while in seclusion.\n\n"
@@ -661,7 +668,7 @@ class Cultivate(commands.Cog):
             title = "⚡ Qi Overflow — Double Advance!" if result.overflow else "✅ Breakthrough Success"
         else:
             color = discord.Color.red()
-            title = "❌ Breakthrough Failed"
+            title = "💢 Breakthrough Failed"
 
         fields: list[dict] = [
             {

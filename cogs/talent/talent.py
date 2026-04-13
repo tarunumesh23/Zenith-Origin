@@ -703,9 +703,13 @@ async def _do_spin(
     view  = _SpinSessionView(ctx, player, talent, guild_id, tokens_left)
 
     if message is None:
-        await ctx.send(embed=embed, view=view)
+        sent = await ctx.send(embed=embed, view=view)
+        # Store the message reference so on_timeout can grey out buttons
+        if isinstance(sent, discord.Message):
+            view.message = sent
     else:
         await message.edit(embed=embed, view=view)
+        view.message = message
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +731,7 @@ class _SpinSessionView(discord.ui.View):
         self.talent      = talent
         self.guild_id    = guild_id
         self.tokens_left = tokens_left
+        self.message: Optional[discord.Message] = None  # set by _do_spin after send
 
         can_spin_again = tokens_left > 0 and len(player.inventory) < INVENTORY_MAX
         self.accept_spin.disabled  = not can_spin_again
@@ -741,8 +746,21 @@ class _SpinSessionView(discord.ui.View):
         return True
 
     async def on_timeout(self) -> None:
+        """Grey out all buttons when the 90-second window expires."""
         for item in self.children:
-            item.disabled = True  # type: ignore[union-attr]
+            if hasattr(item, "disabled"):
+                item.disabled = True  # type: ignore[union-attr]
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass  # message deleted or bot lost permission — safe to ignore
+
+    def _disable_all(self) -> None:
+        """Disable every button immediately to block double-clicks."""
+        for item in self.children:
+            if hasattr(item, "disabled"):
+                item.disabled = True  # type: ignore[union-attr]
 
     # ── shared accept helper ──────────────────────────────────────────────
 
@@ -753,7 +771,7 @@ class _SpinSessionView(discord.ui.View):
         await db.mark_last_spin_accepted(interaction.user.id, self.guild_id)
         if self.talent.name in ONE_PER_SERVER_TALENTS:
             await db.claim_one_per_server(self.guild_id, interaction.user.id, self.talent.name)
-        return msg
+        return msg or "Talent accepted."
 
     # ── ✅ Accept & Spin Again ────────────────────────────────────────────
 
@@ -761,10 +779,27 @@ class _SpinSessionView(discord.ui.View):
     async def accept_spin(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        self._disable_all()
         self.stop()
-        await self._do_accept(interaction)
+
+        try:
+            await self._do_accept(interaction)
+        except Exception:
+            log.exception("accept_spin: _do_accept failed  user=%s", interaction.user.id)
+            await interaction.response.send_message(
+                embed=error_embed(interaction, title="Error", description="Something went wrong saving your talent. Please try again."),
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer()
-        await _do_spin(self.ctx, self.player, self.guild_id, self.tokens_left, message=interaction.message)
+
+        msg = interaction.message
+        if msg is None:
+            log.warning("accept_spin: interaction.message is None — cannot edit")
+            return
+
+        await _do_spin(self.ctx, self.player, self.guild_id, self.tokens_left, message=msg)
 
     # ── ✅ Accept & Stop ──────────────────────────────────────────────────
 
@@ -772,8 +807,19 @@ class _SpinSessionView(discord.ui.View):
     async def accept_stop(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        self._disable_all()
         self.stop()
-        msg = await self._do_accept(interaction)
+
+        try:
+            msg = await self._do_accept(interaction)
+        except Exception:
+            log.exception("accept_stop: _do_accept failed  user=%s", interaction.user.id)
+            await interaction.response.send_message(
+                embed=error_embed(interaction, title="Error", description="Something went wrong saving your talent. Please try again."),
+                ephemeral=True,
+            )
+            return
+
         await safe_edit(
             interaction,
             embed=build_embed(
@@ -791,10 +837,18 @@ class _SpinSessionView(discord.ui.View):
     async def discard_spin(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        self._disable_all()
         self.stop()
+
         reject_talent(self.talent)
         await interaction.response.defer()
-        await _do_spin(self.ctx, self.player, self.guild_id, self.tokens_left, message=interaction.message)
+
+        msg = interaction.message
+        if msg is None:
+            log.warning("discard_spin: interaction.message is None — cannot edit")
+            return
+
+        await _do_spin(self.ctx, self.player, self.guild_id, self.tokens_left, message=msg)
 
     # ── ❌ Discard & Stop ─────────────────────────────────────────────────
 
@@ -802,14 +856,19 @@ class _SpinSessionView(discord.ui.View):
     async def discard_stop(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        self._disable_all()
         self.stop()
-        msg = reject_talent(self.talent)
+
+        discard_msg = reject_talent(self.talent)
+        if not isinstance(discard_msg, str) or not discard_msg:
+            discard_msg = "Talent discarded."
+
         await safe_edit(
             interaction,
             embed=build_embed(
                 interaction,  # type: ignore[arg-type]
                 title="❌ Talent Discarded",
-                description=f"{msg}\n\n🎟️ Tokens remaining: **{self.tokens_left}**",
+                description=f"{discard_msg}\n\n🎟️ Tokens remaining: **{self.tokens_left}**",
                 color=discord.Color.red(),
             ),
             view=None,

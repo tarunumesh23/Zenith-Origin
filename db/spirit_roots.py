@@ -5,10 +5,14 @@ All MySQL queries for the Spirit Root system.
 
 Changes in this revision
 ────────────────────────
-• Fixed ``ON DUPLICATE KEY UPDATE ... VALUES(col)`` deprecation warning in
-  ``set_spin_cooldown``.  Now uses the row alias pattern.
-• Added ``clear_spin_cooldown`` which DELETE-s the row outright (used by
-  AdminSpiritRoots.grant_spin instead of the old 1-second TTL hack).
+• ``apply_spin_result`` now takes ``pity_after`` directly from the engine's
+  ``SpinResult`` instead of re-implementing pity increment/reset logic in SQL.
+  The DB layer should never duplicate game-logic decisions.
+• Leaderboard query changed to ``LEFT JOIN cultivators`` so players without a
+  cultivator row are not silently dropped.
+• Fixed ``ON DUPLICATE KEY UPDATE ... VALUES(col)`` deprecation in
+  ``set_spin_cooldown`` (row alias pattern).
+• Added ``clear_spin_cooldown`` — clean DELETE instead of the old 1-second TTL hack.
 """
 from __future__ import annotations
 
@@ -94,7 +98,12 @@ async def get_spin_history(
 
 
 async def get_leaderboard(guild_id: int, limit: int = 10) -> list[dict]:
-    """Return top *limit* players ranked by best_value DESC, total_spins ASC."""
+    """
+    Return top *limit* players ranked by best_value DESC, total_spins ASC.
+
+    Uses LEFT JOIN so players without a cultivators row are still included,
+    with display_name falling back to NULL (callers should handle that).
+    """
     return await fetch_all(
         """
         SELECT sr.discord_id,
@@ -104,7 +113,7 @@ async def get_leaderboard(guild_id: int, limit: int = 10) -> list[dict]:
                sr.last_spin_at,
                c.display_name
         FROM   spirit_roots sr
-        JOIN   cultivators  c  ON c.discord_id = sr.discord_id
+        LEFT JOIN cultivators c ON c.discord_id = sr.discord_id
         WHERE  sr.guild_id = %s
         ORDER  BY sr.best_value   DESC,
                   sr.total_spins  ASC
@@ -146,58 +155,44 @@ async def apply_spin_result(
     discord_id:     int,
     guild_id:       int,
     rolled_value:   int,
+    final_value:    int,
     outcome:        str,    # 'improved' | 'equal' | 'protected'
     pity_triggered: bool,
+    pity_after:     int,    # authoritative value from SpinResult — no logic here
 ) -> SpiritRootRecord:
-    """Atomically update the spirit root after a spin."""
+    """
+    Atomically update the spirit root after a spin.
+
+    Pity increment / reset logic lives exclusively in the engine layer.
+    This function writes ``pity_after`` verbatim; it does not branch on
+    ``outcome`` or ``pity_triggered`` to compute the new counter itself.
+    """
     if outcome == "improved":
         await execute(
             """
             UPDATE spirit_roots
             SET    current_value = %s,
                    best_value    = GREATEST(best_value, %s),
-                   pity_counter  = 0,
+                   pity_counter  = %s,
                    total_spins   = total_spins + 1,
                    last_spin_at  = NOW()
             WHERE  discord_id = %s AND guild_id = %s
             """,
-            (rolled_value, rolled_value, discord_id, guild_id),
+            (final_value, final_value, pity_after, discord_id, guild_id),
         )
 
-    elif outcome == "equal":
+    elif outcome in ("equal", "protected"):
         await execute(
             """
             UPDATE spirit_roots
-            SET    total_spins  = total_spins + 1,
-                   last_spin_at = NOW()
+            SET    pity_counter  = %s,
+                   total_spins   = total_spins + 1,
+                   last_spin_at  = NOW()
             WHERE  discord_id = %s AND guild_id = %s
             """,
-            (discord_id, guild_id),
+            (pity_after, discord_id, guild_id),
         )
 
-    elif outcome == "protected":
-        if pity_triggered:
-            await execute(
-                """
-                UPDATE spirit_roots
-                SET    pity_counter  = 0,
-                       total_spins   = total_spins + 1,
-                       last_spin_at  = NOW()
-                WHERE  discord_id = %s AND guild_id = %s
-                """,
-                (discord_id, guild_id),
-            )
-        else:
-            await execute(
-                """
-                UPDATE spirit_roots
-                SET    pity_counter  = pity_counter + 1,
-                       total_spins   = total_spins + 1,
-                       last_spin_at  = NOW()
-                WHERE  discord_id = %s AND guild_id = %s
-                """,
-                (discord_id, guild_id),
-            )
     else:
         raise ValueError(f"Unknown spin outcome: {outcome!r}")
 
@@ -306,8 +301,6 @@ async def set_spin_cooldown(discord_id: int, cooldown_seconds: int) -> None:
 
     Pass ``cooldown_seconds=0`` to clear the cooldown immediately
     (delegates to ``clear_spin_cooldown``).
-
-    FIX: replaced deprecated VALUES(col) with row alias pattern.
     """
     if cooldown_seconds <= 0:
         await clear_spin_cooldown(discord_id)
@@ -329,8 +322,8 @@ async def clear_spin_cooldown(discord_id: int) -> None:
     """
     Remove the spin cooldown row entirely so the player can spin immediately.
 
-    Use this instead of ``set_spin_cooldown(id, 1)`` — that left a 1-second
-    TTL row in the table.  This performs a clean DELETE.
+    Prefer this over ``set_spin_cooldown(id, 1)`` — that left a short-TTL
+    row in the table unnecessarily.
     """
     await execute(
         "DELETE FROM cooldowns WHERE discord_id = %s AND command = %s",

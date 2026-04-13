@@ -28,7 +28,7 @@ class InfoView(discord.ui.View):
 
 class Info(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
-        self.bot       = bot
+        self.bot = bot
         self.start_time = time.time()
 
     @commands.hybrid_command(name="info", description="Shows information about the bot")
@@ -43,38 +43,53 @@ class Info(commands.Cog):
         uptime      = discord.utils.format_dt(
             discord.utils.utcnow() - timedelta(seconds=uptime_secs), style="R"
         )
+
         ping  = round(self.bot.latency * 1000)
         owner = self.bot.get_user(OWNER_ID) or await self.bot.fetch_user(OWNER_ID)
 
         fields = [
             {
-                "name": "📊 Stats",
+                "name": "📊 Bot Stats",
                 "value": (
-                    f"**Servers**  : `{guild_count}`\n"
-                    f"**Commands** : `{cmd_count}`\n"
-                    f"**Ping**     : `{ping}ms`\n"
-                    f"**Uptime**   : {uptime}"
+                    f"• **Servers:** `{guild_count}`\n"
+                    f"• **Commands:** `{cmd_count}`\n"
+                    f"• **Ping:** `{ping} ms`\n"
+                    f"• **Uptime:** {uptime}"
                 ),
                 "inline": False,
             },
-            {"name": "👑 Developer", "value": owner.mention,                    "inline": True},
-            {"name": "🌐 Support",   "value": f"[Join Server]({SUPPORT_SERVER})", "inline": True},
+            {
+                "name": "👑 Developer",
+                "value": owner.mention,
+                "inline": True,
+            },
+            {
+                "name": "🌐 Support",
+                "value": f"[Join Server]({SUPPORT_SERVER})",
+                "inline": True,
+            },
         ]
 
         embed = build_embed(
             ctx,
-            title=bot_user.name,
+            title=f"🤖 {bot_user.name}",
             description=(
-                "A fast, reliable, and feature-rich Discord bot.\n"
-                "Use `/help` to view all available commands."
+                "A fast and reliable Discord bot.\n\n"
+                "Use `/help` to explore all commands."
             ),
             fields=fields,
             color=discord.Color.blurple(),
         )
+
         embed.set_thumbnail(url=bot_user.display_avatar.url)
-        embed.set_author(name=f"{bot_user.name} • Information", icon_url=bot_user.display_avatar.url)
+
+        embed.set_author(
+            name=f"{bot_user.name} • Info",
+            icon_url=bot_user.display_avatar.url
+        )
+
         embed.set_footer(
-            text=f"ID: {bot_user.id} • Requested by {ctx.author}",
+            text=f"ID: {bot_user.id}",
             icon_url=ctx.author.display_avatar.url,
         )
 

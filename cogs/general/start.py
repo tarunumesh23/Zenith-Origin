@@ -18,6 +18,8 @@ from spirit_roots import roll_root
 from ui.embed import build_embed
 from ui.interaction_utils import safe_edit
 
+from talent.constants import RARITIES, ONE_PER_SERVER_TALENTS
+
 log = logging.getLogger("bot.cogs.start")
 
 CULTIVATION_LOG_CHANNEL = int(os.getenv("CULTIVATION_LOG_CHANNEL", "0"))
@@ -28,9 +30,9 @@ class Start(commands.Cog):
         self.bot = bot
         self.active_users: set[int] = set()
 
-    # ------------------------------------------------------------------
-    # Command
-    # ------------------------------------------------------------------
+    # ───────────────────────────────────────────────────────────────
+    # /start
+    # ───────────────────────────────────────────────────────────────
 
     @commands.hybrid_command(name="start", description="Begin your path of cultivation")
     @commands.cooldown(1, 5, commands.BucketType.user)
@@ -42,43 +44,31 @@ class Start(commands.Cog):
                 embed=build_embed(
                     ctx,
                     title="⚡ Already Awakened",
-                    description="You have already walked the Path. There is no need to prove yourself again.",
+                    description="You have already walked the Path.",
                     color=discord.Color.gold(),
                 ),
                 ephemeral=True,
             )
             return
 
+        # Soft reset instead of blocking forever
         if uid in self.active_users:
-            await ctx.send(
-                embed=build_embed(
-                    ctx,
-                    title="⏳ Trial In Progress",
-                    description="You are already on your trial. Focus.",
-                    color=discord.Color.orange(),
-                ),
-                ephemeral=True,
-            )
-            return
+            self.active_users.discard(uid)
 
         self.active_users.add(uid)
-        log.info("Story » %s started the intro trial", ctx.author)
-        await self._send_scene(ctx, scene_index=0, score=0)
+        log.info("Start » %s began trial", ctx.author)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        await self._send_scene(ctx, 0, 0)
 
-    async def _send_scene(
-        self,
-        ctx: commands.Context,
-        scene_index: int,
-        score: int,
-    ) -> None:
+    # ───────────────────────────────────────────────────────────────
+
+    async def _send_scene(self, ctx: commands.Context, scene_index: int, score: int) -> None:
         scene = SCENES[scene_index]
         embed = _build_scene_embed(ctx, scene_index, scene["description"])
         view  = SceneView(self, ctx, scene_index, score)
         await ctx.send(embed=embed, view=view)
+
+    # ───────────────────────────────────────────────────────────────
 
     async def send_outcome(
         self,
@@ -88,6 +78,7 @@ class Start(commands.Cog):
     ) -> None:
         self.active_users.discard(ctx.author.id)
 
+        # Outcome logic
         if score >= 8:
             key = "pass"
         elif score >= 4:
@@ -96,76 +87,79 @@ class Start(commands.Cog):
             key = "fail"
 
         outcome  = OUTCOMES[key]
-        affinity: str | None = random.choice(AFFINITIES) if key == "pass" else None
         guild_id = ctx.guild.id if ctx.guild else 0
+        affinity = random.choice(AFFINITIES) if key == "pass" else None
 
-        affinity_line = (
-            f"\n\n**Elemental Affinity Awakened:** {AFFINITY_DISPLAY[affinity]}"
-            if affinity else ""
-        )
+        # ── Reward blocks ─────────────────────────────
+        affinity_text = ""
+        talent_text   = ""
+        root_text     = ""
 
-        # ── Roll starter talent on pass ───────────────────────────────
         starter_talent = None
-        talent_line    = ""
+        starter_root   = None
 
         if key == "pass":
+            # ── Affinity
+            affinity_text = f"🌿 **Affinity:** {AFFINITY_DISPLAY[affinity]}"
+
+            # ── Talent
             try:
-                claimed        = await talent_db.get_claimed_one_per_server(guild_id)
+                claimed = await talent_db.get_claimed_one_per_server(guild_id)
                 starter_talent = roll_starter_talent(claimed)
 
-                from talent.constants import RARITIES
-                rarity_data = RARITIES.get(starter_talent.rarity, {})
-                talent_line = (
-                    f"\n\n**Talent Awakened:** "
-                    f"{rarity_data.get('emoji', '')} **{starter_talent.name}** "
-                    f"[{starter_talent.rarity}]"
-                    f"\n*{starter_talent.description}*"
+                rarity = RARITIES.get(starter_talent.rarity, {})
+                talent_text = (
+                    f"🌟 **Talent:** {rarity.get('emoji','')} **{starter_talent.name}** "
+                    f"[{starter_talent.rarity}]\n"
+                    f"*{starter_talent.description}*"
                 )
             except Exception:
-                log.exception(
-                    "Story » Failed to roll starter talent for discord_id=%s", ctx.author.id
-                )
+                log.exception("Start » talent roll failed")
 
-        # ── Roll starter spirit root on pass ──────────────────────────
-        starter_root = None
-        root_line    = ""
-
-        if key == "pass":
+            # ── Spirit Root
             try:
                 starter_root = roll_root()
-                root_line = (
-                    f"\n\n**Spirit Root Awakened:** "
-                    f"{starter_root.emoji} **{starter_root.name}** (Tier {starter_root.value})"
-                    f"\n*{starter_root.description}*"
+                root_text = (
+                    f"🌱 **Spirit Root:** {starter_root.emoji} **{starter_root.name}** "
+                    f"(Tier {starter_root.value})\n"
+                    f"*{starter_root.description}*"
                 )
             except Exception:
-                log.exception(
-                    "Story » Failed to roll starter root for discord_id=%s", ctx.author.id
-                )
+                log.exception("Start » root roll failed")
+
+        # ── Build embed (clean UI) ───────────────────
+        desc_parts = [
+            outcome["description"],
+            "",
+            f"**Final Score:** `{score}/10`",
+        ]
+
+        if affinity_text:
+            desc_parts.append("\n" + affinity_text)
+        if talent_text:
+            desc_parts.append("\n" + talent_text)
+        if root_text:
+            desc_parts.append("\n" + root_text)
 
         embed = build_embed(
             ctx,
             title=outcome["title"],
-            description=(
-                f"{outcome['description']}"
-                f"{affinity_line}"
-                f"{talent_line}"
-                f"{root_line}"
-                f"\n\n**Final Score:** `{score}/10`"
-            ),
+            description="\n".join(desc_parts),
             color=outcome["color"],
             show_footer=True,
         )
+
         embed.set_author(
             name=ctx.author.display_name,
             icon_url=ctx.author.display_avatar.url,
         )
+
         if STORY_BANNER_URL:
             embed.set_image(url=STORY_BANNER_URL)
 
         await safe_edit(interaction, embed=embed, view=None)
 
-        # ── Persist cultivator row ────────────────────────────────────
+        # ── Persist player ───────────────────────────
         try:
             await upsert_cultivator(
                 discord_id=ctx.author.id,
@@ -177,12 +171,12 @@ class Start(commands.Cog):
             if affinity:
                 await set_affinity(ctx.author.id, affinity)
         except Exception:
-            log.exception("Story » Failed to upsert cultivator %s", ctx.author.id)
+            log.exception("Start » cultivator save failed")
 
-        # ── Persist starter talent ────────────────────────────────────
-        if key == "pass" and starter_talent is not None:
+        # ── Save talent ──────────────────────────────
+        if starter_talent:
             try:
-                player = PlayerTalentData(user_id=ctx.author.id, guild_id=guild_id)
+                player = PlayerTalentData(ctx.author.id, guild_id)
                 player.active_talent = starter_talent
                 await talent_db.save_player_talent_data(player)
 
@@ -195,103 +189,60 @@ class Start(commands.Cog):
                     accepted=True,
                 )
 
-                from talent.constants import ONE_PER_SERVER_TALENTS
                 if starter_talent.name in ONE_PER_SERVER_TALENTS:
                     await talent_db.claim_one_per_server(
                         guild_id, ctx.author.id, starter_talent.name
                     )
 
-                log.info(
-                    "Story » starter talent assigned discord_id=%s talent=%s rarity=%s",
-                    ctx.author.id, starter_talent.name, starter_talent.rarity,
-                )
             except Exception:
-                log.exception(
-                    "Story » Failed to save starter talent for discord_id=%s", ctx.author.id
-                )
+                log.exception("Start » talent save failed")
 
-        # ── Persist starter spirit root ───────────────────────────────
-        if key == "pass" and starter_root is not None:
+        # ── Save root ────────────────────────────────
+        if starter_root:
             try:
                 existing = await spirit_roots_db.get_spirit_root(ctx.author.id, guild_id)
-                if existing is None:
+                if not existing:
                     await spirit_roots_db.create_spirit_root(
                         ctx.author.id, guild_id, starter_root.value
                     )
-                    log.info(
-                        "Story » starter root assigned discord_id=%s root=%s tier=%d",
-                        ctx.author.id, starter_root.name, starter_root.value,
-                    )
-                else:
-                    log.warning(
-                        "Story » spirit root already exists for discord_id=%s — skipping",
-                        ctx.author.id,
-                    )
             except Exception:
-                log.exception(
-                    "Story » Failed to save starter root for discord_id=%s", ctx.author.id
-                )
+                log.exception("Start » root save failed")
 
+        # ── Log ──────────────────────────────────────
         log.info(
-            "Story » %s finished trial — outcome=%s score=%d affinity=%s talent=%s root=%s",
-            ctx.author, key, score, affinity,
-            starter_talent.name if starter_talent else "none",
-            f"{starter_root.name} (T{starter_root.value})" if starter_root else "none",
+            "Start » %s outcome=%s score=%d",
+            ctx.author, key, score
         )
 
         if key == "pass":
             await self._log_cultivator(ctx, affinity, starter_talent, starter_root)
 
-    async def _log_cultivator(
-        self,
-        ctx: commands.Context,
-        affinity: str | None = None,
-        starter_talent=None,
-        starter_root=None,
-    ) -> None:
+    # ───────────────────────────────────────────────────────────────
+
+    async def _log_cultivator(self, ctx, affinity, talent, root):
         channel = self.bot.get_channel(CULTIVATION_LOG_CHANNEL)
-        if channel is None:
-            log.warning("Story » CULTIVATION_LOG_CHANNEL %d not found", CULTIVATION_LOG_CHANNEL)
+        if not channel:
             return
 
-        affinity_line = (
-            f"\nElemental Affinity: {AFFINITY_DISPLAY[affinity]}"
-            if affinity else ""
-        )
+        parts = [
+            f"{ctx.author.mention} has awakened.",
+            "",
+        ]
 
-        talent_line = ""
-        if starter_talent is not None:
-            from talent.constants import RARITIES
-            rarity_data = RARITIES.get(starter_talent.rarity, {})
-            talent_line = (
-                f"\nTalent: {rarity_data.get('emoji', '')} {starter_talent.name} "
-                f"[{starter_talent.rarity}]"
-            )
-
-        root_line = ""
-        if starter_root is not None:
-            root_line = (
-                f"\nSpirit Root: {starter_root.emoji} {starter_root.name} "
-                f"(Tier {starter_root.value})"
-            )
+        if affinity:
+            parts.append(f"🌿 {AFFINITY_DISPLAY[affinity]}")
+        if talent:
+            parts.append(f"🌟 {talent.name} [{talent.rarity}]")
+        if root:
+            parts.append(f"🌱 {root.name} (T{root.value})")
 
         embed = build_embed(
             ctx,
-            title="⚡ A New Cultivator Has Emerged",
-            description=(
-                f"{ctx.author.mention} has proven themselves worthy.\n"
-                f"The Dao has opened its gates."
-                f"{affinity_line}"
-                f"{talent_line}"
-                f"{root_line}"
-            ),
+            title="⚡ New Cultivator",
+            description="\n".join(parts),
             color=discord.Color.gold(),
             thumbnail=ctx.author.display_avatar.url,
-            show_footer=True,
         )
-        embed.set_footer(text=f"ID: {ctx.author.id}")
-        if STORY_BANNER_URL:
-            embed.set_image(url=STORY_BANNER_URL)
 
         await channel.send(embed=embed)
 

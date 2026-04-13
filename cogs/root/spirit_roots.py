@@ -143,63 +143,88 @@ def _pity_bar(current: int, threshold: int) -> str:
 
 
 def _spin_embed(result: SpinResult, user: discord.User | discord.Member) -> discord.Embed:
-    tier   = result.final_tier
+    tier = result.final_tier
     colour = tier.colour if result.is_improved else _OUTCOME_COLOURS[result.outcome]
-    embed  = discord.Embed(title=_OUTCOME_TITLES[result.outcome], colour=colour)
+
+    embed = discord.Embed(
+        title=_OUTCOME_TITLES[result.outcome],
+        colour=colour,
+    )
+
     embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
 
+    # ── Description ─────────────────────────────
     if result.is_improved:
         embed.description = (
-            f"Your Spirit Root has advanced!\n\n"
-            f"{tier.emoji}  **{tier.name}**\n"
+            f"✨ **Your Spirit Root has evolved!**\n\n"
+            f"{tier.emoji} **{tier.name}**\n"
             f"*{tier.description}*"
         )
-        bonuses_text = describe_spirit_root_bonuses(tier.value)
-        if bonuses_text and bonuses_text != "No cultivation bonuses.":
-            embed.add_field(name="📊 Cultivation Bonuses", value=bonuses_text, inline=False)
 
     elif result.is_protected:
         embed.description = (
-            f"The heavens attempted to diminish your root — the Safe System held firm.\n\n"
-            f"Rolled **{result.rolled_tier.name}** → kept **{result.final_tier.name}**."
+            f"🛡️ The heavens tested you — but your foundation held firm.\n\n"
+            f"Rolled **{result.rolled_tier.name}** → Kept **{tier.name}**"
         )
 
-    else:  # equal
+    else:
         embed.description = (
-            f"The heavens offered the same root you already possess.\n\n"
-            f"{tier.emoji}  **{tier.name}**"
+            f"⚖️ The heavens remain unchanged.\n\n"
+            f"{tier.emoji} **{tier.name}**"
         )
 
+    # ── Bonuses ─────────────────────────────
+    if result.is_improved:
+        bonuses_text = describe_spirit_root_bonuses(tier.value)
+        if bonuses_text and bonuses_text != "No cultivation bonuses.":
+            embed.add_field(
+                name="📊 Cultivation Bonuses",
+                value=bonuses_text,
+                inline=False,
+            )
+
+    # ── Pity ─────────────────────────────
     if result.pity_triggered:
         embed.add_field(
-            name="✨ Pity Guarantee Triggered",
-            value=f"After **{result.pity_before}** non-improving spins the heavens relented.",
+            name="✨ Pity Triggered",
+            value=f"After **{result.pity_before}** failed attempts, fate intervened.",
             inline=False,
         )
 
-    if not result.is_improved and result.pity_after > 0:
+    if not result.is_improved:
         embed.add_field(
             name="🔮 Pity Progress",
             value=_pity_bar(result.pity_after, PITY_THRESHOLD),
             inline=False,
         )
 
-    embed.set_footer(text=f"Floor: Tier {result.floor_applied}  •  Rolled: {result.rolled_tier.name}")
+    embed.set_footer(
+        text=f"Floor: Tier {result.floor_applied}  •  Rolled: {result.rolled_tier.name}"
+    )
+
     return embed
 
 
 def _cooldown_embed(seconds_left: float, user: discord.User | discord.Member) -> discord.Embed:
-    hours, rem    = divmod(int(seconds_left), 3600)
+    hours, rem = divmod(int(seconds_left), 3600)
     minutes, secs = divmod(rem, 60)
-    time_str = f"{hours}h {minutes}m {secs}s" if hours else f"{minutes}m {secs}s"
+
+    if hours:
+        time_str = f"{hours}h {minutes}m"
+    elif minutes:
+        time_str = f"{minutes}m {secs}s"
+    else:
+        time_str = f"{secs}s"
+
     embed = discord.Embed(
-        title="⏳ Cooldown Active",
+        title="⏳ Spirit Root Cooldown",
         description=(
-            f"Your Spirit Root is still settling from the last awakening.\n\n"
-            f"You may spin again in **{time_str}**."
+            "Your spiritual energy is still stabilizing.\n\n"
+            f"⏱️ Try again in **{time_str}**"
         ),
         colour=0xE74C3C,
     )
+
     embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
     return embed
 
@@ -209,7 +234,7 @@ def _profile_embed(row: dict[str, Any], user: discord.User | discord.Member) -> 
     best    = get_tier_by_value(row["best_value"])
 
     embed = discord.Embed(
-        title=f"{current.emoji} {current.name}",
+        title=f"{current.emoji} {current.name} • Spirit Root",  # ← visual polish
         description=current.description,
         colour=current.colour,
     )
@@ -290,12 +315,24 @@ class SpinView(discord.ui.View):
         self.user_id  = user_id
         self.guild_id = guild_id
 
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if hasattr(item, "disabled"):
+                item.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
+
     @discord.ui.button(label="🎲 Spin Again", style=discord.ButtonStyle.primary)
     async def spin_again(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
+
+        # ownership check
         if interaction.user.id != self.user_id:
             await safe_send(
                 interaction,
@@ -307,21 +344,39 @@ class SpinView(discord.ui.View):
             )
             return
 
-        button.disabled = True
-
-        deferred = await safe_defer(interaction, ephemeral=False, thinking=True)
-        if not deferred:
+        # prevent double click spam
+        if button.disabled:
             return
 
-        await safe_edit(interaction, view=self)
+        button.disabled = True
 
-        result_embed, new_view = await self.cog._do_spin(interaction.user, self.guild_id)
-        await safe_edit(interaction, embed=result_embed, view=new_view)
+        # safe defer (handles already responded edge cases)
+        try:
+            await safe_defer(interaction, ephemeral=False, thinking=True)
+        except Exception:
+            return
 
-    async def on_timeout(self) -> None:
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True  # type: ignore[attr-defined]
+        # update button state immediately
+        try:
+            await safe_edit(interaction, view=self)
+        except Exception:
+            pass  # message may be gone, ignore
+
+        # run spin
+        try:
+            result_embed, new_view = await self.cog._do_spin(
+                interaction.user,
+                self.guild_id,
+            )
+        except Exception as e:
+            log.exception("SpinView error", exc_info=e)
+            return
+
+        # final update
+        try:
+            await safe_edit(interaction, embed=result_embed, view=new_view)
+        except Exception:
+            pass  # interaction expired or message gone
 
 
 # ---------------------------------------------------------------------------

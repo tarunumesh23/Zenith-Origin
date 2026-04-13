@@ -84,8 +84,9 @@ def _cmd_signature(name: str, signature: str, description: str) -> str:
     sig = f"`/{name}"
     if signature:
         sig += f" {signature}"
-    sig += f"` — {description or 'No description'}"
-    return sig
+    sig += "`"
+
+    return f"{sig}\n> {description or 'No description'}"
 
 
 def _collect_commands(bot: commands.Bot) -> dict[str, list[str]]:
@@ -162,8 +163,8 @@ def _build_pages(
         embed = build_embed(
             ctx,
             title=f"{label} Commands",
-            description=f"*{desc}*\n\n" + "\n".join(cmd_lines),
-            color=discord.Color.blurple(),
+            description=( f"*{desc}*\n\n" + "\n\n".join(cmd_lines)
+)
         )
         pages[cat_key] = CategoryPage(
             key=cat_key,
@@ -177,18 +178,19 @@ def _build_pages(
 
 
 def _build_overview(ctx: commands.Context, pages: dict[str, CategoryPage]) -> discord.Embed:
-    overview_lines = [
-        f"**{p.label}** — {p.count} command(s)"
+    lines = [
+        f"**{p.label}**\n> {p.count} command(s)"
         for p in pages.values()
     ]
+
     return build_embed(
         ctx,
-        title="📖 Help — Command Categories",
+        title="📖 Help Menu",
         description=(
-            "Use `/command` or `z!command` for any listed command.\n"
-            "Arguments: `<required>` · `[optional]`\n\n"
-            + "\n".join(overview_lines)
-            + "\n\n*Select a category from the dropdown below.*"
+            "Use `/command` or `z!command`\n"
+            "`<required>` • `[optional]`\n\n"
+            + "\n\n".join(lines)
+            + "\n\nSelect a category below."
         ),
         color=discord.Color.blurple(),
     )
@@ -210,7 +212,7 @@ class HelpSelect(discord.ui.Select):
             for page in pages.values()
         ]
         super().__init__(
-            placeholder="Choose a category…",
+            placeholder="Select a command category",
             min_values=1,
             max_values=1,
             options=options,
@@ -301,7 +303,7 @@ class General(commands.Cog):
                 embed=build_embed(
                     ctx,
                     title="⏳ Slow down",
-                    description=f"You can use `/help` again in **{error.retry_after:.1f}s**.",
+                    description=f"Try again in **{error.retry_after:.1f}s**.",
                     color=discord.Color.red(),
                 ),
                 ephemeral=True,

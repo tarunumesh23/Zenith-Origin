@@ -48,6 +48,7 @@ from db.pvp import (
     set_ward,
     transfer_qi,
 )
+from training.pvp_bridge import load_modifiers, apply_training_to_round
 from ui.embed import build_embed, error_embed, warning_embed
 from ui.interaction_utils import safe_defer
 
@@ -622,22 +623,52 @@ class PvP(commands.Cog):
         challenger = _make_combatant(c_row)
         target     = _make_combatant(t_row)
 
+        guild_id = ctx.guild.id
+        a_mods   = await load_modifiers(c_row["discord_id"], guild_id)
+        t_mods   = await load_modifiers(t_row["discord_id"], guild_id)
+
         if warded:
             rounds = []
             c_wins = t_wins = 0
             for _ in range(3):
                 cp = _roll_power(challenger, target)
-                tp = _roll_power(target, challenger) * 1.30
-                c_won = cp > tp
+                tp = _roll_power(target, challenger)
+                tr = apply_training_to_round(
+                    cp, tp * 1.30,
+                    a_mods, t_mods,
+                    "strike", "strike",
+                )
+                c_won = tr.round_winner == "a"
                 if c_won: c_wins += 1
                 else:     t_wins += 1
-                rounds.append(RoundResult(challenger_power=cp, target_power=tp, challenger_won=c_won))
+                rounds.append(RoundResult(
+                    challenger_power=tr.a_effective,
+                    target_power=tr.b_effective,
+                    challenger_won=c_won,
+                ))
             result = CombatResult(
                 challenger_won=c_wins > t_wins, rounds=rounds,
                 challenger_wins=c_wins, target_wins=t_wins,
             )
         else:
-            result = resolve_combat(challenger, target)
+            rounds = []
+            c_wins = t_wins = 0
+            for _ in range(3):
+                cp = _roll_power(challenger, target)
+                tp = _roll_power(target, challenger)
+                tr = apply_training_to_round(cp, tp, a_mods, t_mods)
+                c_won = tr.round_winner == "a"
+                if c_won: c_wins += 1
+                else:     t_wins += 1
+                rounds.append(RoundResult(
+                    challenger_power=tr.a_effective,
+                    target_power=tr.b_effective,
+                    challenger_won=c_won,
+                ))
+            result = CombatResult(
+                challenger_won=c_wins > t_wins, rounds=rounds,
+                challenger_wins=c_wins, target_wins=t_wins,
+            )
 
         ambush_cd  = now + timedelta(hours=AMBUSH_COOLDOWN_HOURS)
         rounds_str = "\n".join(

@@ -122,16 +122,6 @@ async def _migration_20(total: int) -> None:
 async def _migration_21(total: int) -> None:
     """
     Fix breakthrough_log.outcome ENUM mismatch.
-
-    The table was created with ENUM('success','minor_fail','major_fail') on some
-    installs.  MySQL stores ENUM values as integer indices, so rows written with
-    the old schema have index values that no longer map to anything once the
-    ENUM definition changes — causing 'Data truncated' even on SELECT/UPDATE.
-
-    Safe approach:
-      1. Cast column to VARCHAR so all integer indices become their string labels.
-      2. Normalise all non-'success' values to 'fail'.
-      3. Cast back to the correct ENUM('success','fail').
     """
     row = await fetch_one(
         """
@@ -150,24 +140,18 @@ async def _migration_21(total: int) -> None:
 
     column_type = (row.get("COLUMN_TYPE") or "").lower()
 
-    # Already clean
     if "minor_fail" not in column_type and "major_fail" not in column_type:
         log.debug("Migration 21/%d SKIP — outcome ENUM already clean", total)
         return
 
     log.info("Migration 21/%d — fixing breakthrough_log.outcome ENUM …", total)
 
-    # Step 1: Convert to VARCHAR — this makes all stored integer indices
-    # readable as their original string values regardless of current ENUM def.
     await execute(
         """
         ALTER TABLE breakthrough_log
         MODIFY COLUMN outcome VARCHAR(20) NOT NULL
         """
     )
-
-    # Step 2: Normalise — anything that isn't 'success' becomes 'fail'.
-    # This covers 'minor_fail', 'major_fail', empty strings, or any garbage.
     await execute(
         """
         UPDATE breakthrough_log
@@ -177,8 +161,6 @@ async def _migration_21(total: int) -> None:
         END
         """
     )
-
-    # Step 3: Convert back to the correct clean ENUM.
     await execute(
         """
         ALTER TABLE breakthrough_log
@@ -192,8 +174,6 @@ async def _migration_21(total: int) -> None:
 async def _migration_22(total: int) -> None:
     """
     Ensure player_talents has a Cosmic rarity option.
-    Some installs were created before Cosmic was added to the ENUM.
-    Also covers talent_inventory and talent_spin_log.
     """
     for table in ("player_talents", "talent_inventory", "talent_spin_log"):
         row = await fetch_one(
@@ -222,6 +202,112 @@ async def _migration_22(total: int) -> None:
             """
         )
         log.debug("Migration 22/%d OK — added Cosmic to %s.talent_rarity", total, table)
+
+
+# =========================================================================
+#  TRAINING SYSTEM  (migrations 23–24)
+# =========================================================================
+
+async def _migration_23(total: int) -> None:
+    """Create training_stats table if it does not already exist."""
+    row = await fetch_one(
+        """
+        SELECT COUNT(*) AS cnt FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'training_stats'
+        """,
+        (),
+    )
+    if row and row["cnt"]:
+        log.debug("Migration 23/%d SKIP — training_stats already exists", total)
+        return
+
+    await execute(
+        """
+        CREATE TABLE training_stats (
+            discord_id      BIGINT UNSIGNED   NOT NULL,
+            guild_id        BIGINT UNSIGNED   NOT NULL,
+
+            atk             FLOAT             NOT NULL DEFAULT 0.0,
+            def_            FLOAT             NOT NULL DEFAULT 0.0,
+            spe             FLOAT             NOT NULL DEFAULT 0.0,
+            eva             FLOAT             NOT NULL DEFAULT 0.0,
+            crit_chance     FLOAT             NOT NULL DEFAULT 0.0,
+            crit_dmg        FLOAT             NOT NULL DEFAULT 0.0,
+
+            mastery_body    SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+            mastery_flow    SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+            mastery_killing SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+
+            tier_body       ENUM('beginner','advanced','forbidden') NOT NULL DEFAULT 'beginner',
+            tier_flow       ENUM('beginner','advanced','forbidden') NOT NULL DEFAULT 'beginner',
+            tier_killing    ENUM('beginner','advanced','forbidden') NOT NULL DEFAULT 'beginner',
+
+            fatigue                   FLOAT             NOT NULL DEFAULT 0.0,
+            deviation_streak          TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+            cascade_lock              TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+
+            injury_body_remaining     TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+            injury_flow_remaining     TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+            injury_killing_remaining  TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+
+            passive_tags    JSON                        NOT NULL DEFAULT ('[]'),
+
+            last_path_trained         VARCHAR(30)       DEFAULT NULL,
+            consecutive_path_sessions TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+
+            created_at      DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_updated    DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+            PRIMARY KEY (discord_id, guild_id),
+            FOREIGN KEY (discord_id)
+                REFERENCES cultivators(discord_id) ON DELETE CASCADE,
+
+            CONSTRAINT chk_ts_fatigue CHECK (fatigue BETWEEN 0.0 AND 10.0)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
+    )
+    log.info("Migration 23/%d OK — training_stats table created", total)
+
+
+async def _migration_24(total: int) -> None:
+    """Create training_sessions audit log table if it does not already exist."""
+    row = await fetch_one(
+        """
+        SELECT COUNT(*) AS cnt FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'training_sessions'
+        """,
+        (),
+    )
+    if row and row["cnt"]:
+        log.debug("Migration 24/%d SKIP — training_sessions already exists", total)
+        return
+
+    await execute(
+        """
+        CREATE TABLE training_sessions (
+            id              BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            discord_id      BIGINT UNSIGNED   NOT NULL,
+            guild_id        BIGINT UNSIGNED   NOT NULL,
+
+            path            ENUM('body_tempering','flow_arts','killing_sense') NOT NULL,
+            tier            ENUM('beginner','advanced','forbidden')            NOT NULL,
+
+            stats_gained    JSON              NOT NULL DEFAULT ('{}'),
+            mastery_gained  TINYINT UNSIGNED  NOT NULL DEFAULT 0,
+
+            risk_event_type ENUM('qi_deviation','injury','mental_fracture','mutation') DEFAULT NULL,
+            overtraining    BOOLEAN           NOT NULL DEFAULT FALSE,
+
+            trained_at      DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+            FOREIGN KEY (discord_id)
+                REFERENCES cultivators(discord_id) ON DELETE CASCADE,
+
+            INDEX idx_ts_player (discord_id, guild_id, trained_at)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
+    )
+    log.info("Migration 24/%d OK — training_sessions table created", total)
 
 
 MIGRATIONS: list[str | object] = [
@@ -521,6 +607,16 @@ MIGRATIONS: list[str | object] = [
 
     # 22. Add Cosmic rarity to talent ENUM columns on existing installs.
     _migration_22,
+
+    # =========================================================================
+    #  TRAINING SYSTEM  (migrations 23–24)
+    # =========================================================================
+
+    # 23. training_stats — one row per player per guild, all six combat stats.
+    _migration_23,
+
+    # 24. training_sessions — audit log for every session run.
+    _migration_24,
 ]
 
 

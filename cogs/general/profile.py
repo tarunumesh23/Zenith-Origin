@@ -20,7 +20,9 @@ from cultivation.constants import (
 from db import cultivators as db
 from db import spirit_roots as spirit_roots_db
 from db import talent as talent_db
+from db import training as training_db
 from spirit_roots.data import get_tier_by_value
+from training.constants import STAT_CAPS, TIER_DISPLAY
 from ui.embed import build_embed, error_embed
 from ui.interaction_utils import safe_defer
 
@@ -44,6 +46,13 @@ def _qi_bar(current: int, threshold: int) -> str:
     pct    = min(current / threshold, 1.0) if threshold else 0.0
     filled = round(pct * _BAR_WIDTH)
     return "█" * filled + "░" * (_BAR_WIDTH - filled)
+
+
+# ── Stat mini-bar (10 chars) ──────────────────────────────────────────────────
+def _stat_bar(value: float, cap: int, width: int = 8) -> str:
+    pct    = min(value / max(cap, 1), 1.0)
+    filled = int(pct * width)
+    return "█" * filled + "░" * (width - filled)
 
 
 # ── Reputation badge ──────────────────────────────────────────────────────────
@@ -83,6 +92,67 @@ def _talent_line(active_talent) -> str:
         )
     except Exception:
         return "*Error loading talent*"
+
+
+# ── Training stats block ──────────────────────────────────────────────────────
+def _training_block(t) -> str:
+    """
+    Build the training stats field value from a TrainingStatsRecord (or None).
+    Shows all six stats with mini progress bars and current tier per path.
+    """
+    if t is None:
+        return "*No training record yet — use `/train` to begin.*"
+
+    # Per-stat bars using current tier cap
+    atk_cap      = STAT_CAPS[t.tier_body]["atk"]
+    def_cap      = STAT_CAPS[t.tier_body]["def"]
+    spe_cap      = STAT_CAPS[t.tier_flow]["spe"]
+    eva_cap      = STAT_CAPS[t.tier_flow]["eva"]
+    crit_cap     = STAT_CAPS[t.tier_killing]["crit_chance"]
+    crit_dmg_cap = STAT_CAPS[t.tier_killing]["crit_dmg"]
+
+    def line(emoji: str, label: str, val: float, cap: int) -> str:
+        bar = _stat_bar(val, cap)
+        return f"{emoji} **{label}** `{bar}` `{int(val)}/{cap}`"
+
+    # Tier badges
+    body_tier = TIER_DISPLAY[t.tier_body]
+    flow_tier = TIER_DISPLAY[t.tier_flow]
+    kill_tier = TIER_DISPLAY[t.tier_killing]
+
+    # Active injury / lock indicators
+    warnings = []
+    if t.injury_body_remaining > 0:
+        warnings.append(f"🩹 Body locked `{t.injury_body_remaining}`s")
+    if t.injury_flow_remaining > 0:
+        warnings.append(f"🩹 Flow locked `{t.injury_flow_remaining}`s")
+    if t.injury_killing_remaining > 0:
+        warnings.append(f"🩹 Killing locked `{t.injury_killing_remaining}`s")
+    if t.cascade_lock > 0:
+        warnings.append(f"⚠️ Cascade `{t.cascade_lock}`s")
+
+    warn_str = "  " + "  ".join(warnings) if warnings else ""
+
+    total_power = int(t.atk + t.def_ + t.spe + t.eva + t.crit_chance + t.crit_dmg)
+
+    rows = [
+        f"**Total Power** `{total_power}`{warn_str}",
+        f"🩸 *Body Tempering* — {body_tier}",
+        line("⚔️", "ATK", t.atk, atk_cap),
+        line("🛡️", "DEF", t.def_, def_cap),
+        f"🌬️ *Flow Arts* — {flow_tier}",
+        line("💨", "SPE", t.spe, spe_cap),
+        line("🌀", "EVA", t.eva, eva_cap),
+        f"🔥 *Killing Sense* — {kill_tier}",
+        line("🎯", "CRIT%", t.crit_chance, crit_cap),
+        line("💥", "CRIT DMG", t.crit_dmg, crit_dmg_cap),
+    ]
+
+    if t.passive_tags:
+        tags_str = "  ".join(f"`{tag.replace('_', ' ').title()}`" for tag in t.passive_tags)
+        rows.append(f"🧬 {tags_str}")
+
+    return "\n".join(rows)
 
 
 # ── Profile embed builder ─────────────────────────────────────────────────────
@@ -146,7 +216,15 @@ async def _build_profile_embed(
     except Exception:
         log.warning("Profile » talent load failed discord_id=%s", target.id)
 
-    # ── Combat stats ──────────────────────────────────────────────────
+    # ── Training stats ────────────────────────────────────────────────
+    training_text = "*No training record yet — use `/train` to begin.*"
+    try:
+        training_record = await training_db.get_training_stats(target.id, guild_id)
+        training_text   = _training_block(training_record)
+    except Exception:
+        log.warning("Profile » training load failed discord_id=%s", target.id)
+
+    # ── Combat record ─────────────────────────────────────────────────
     wins   = row.get("total_wins",      0)
     losses = row.get("total_losses",    0)
     fled   = row.get("fled_challenges", 0)
@@ -176,7 +254,12 @@ async def _build_profile_embed(
             "inline": True,
         },
         {
-            "name":   "⚔️ ── COMBAT RECORD ─────────────────",
+            "name":   "⚔️ ── COMBAT TRAINING ───────────────",
+            "value":  training_text,
+            "inline": False,
+        },
+        {
+            "name":   "🏟️ ── COMBAT RECORD ──────────────────",
             "value":  (
                 f"🏆 **{wins}** Wins  ·  💀 **{losses}** Losses  ·  🏃 **{fled}** Fled\n"
                 f"Win Rate: `{wr_str}`  ·  Reputation: `{rep:+d}`"
